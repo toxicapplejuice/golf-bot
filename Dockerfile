@@ -16,5 +16,5 @@ RUN playwright install firefox
 # Copy bot code (not .env - secrets come from Fly)
 COPY bot.py config.py ./
 
-# Run the bot immediately with --now flag (scheduling handled by Fly)
-CMD ["python", "-u", "bot.py", "--now"]
+# Run the bot (waits for 8pm CT release time, then books)
+CMD ["python", "-u", "bot.py"]
