@@ -1,0 +1,20 @@
+FROM mcr.microsoft.com/playwright/python:v1.41.0-jammy
+
+WORKDIR /app
+
+# Set timezone to Central Time
+ENV TZ=America/Chicago
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Firefox for Playwright
+RUN playwright install firefox
+
+# Copy bot code (not .env - secrets come from Fly)
+COPY bot.py config.py ./
+
+# Run the bot immediately with --now flag (scheduling handled by Fly)
+CMD ["python", "-u", "bot.py", "--now"]

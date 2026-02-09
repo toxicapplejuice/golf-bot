@@ -1,0 +1,10 @@
+app = "golf-bot-austin"
+primary_region = "dfw"
+
+[build]
+
+[env]
+  TZ = "America/Chicago"
+
+# This is a scheduled job, not a web service
+# No HTTP service needed
