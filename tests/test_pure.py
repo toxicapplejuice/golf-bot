@@ -1,4 +1,4 @@
-"""Tests for pure (no-browser) functions in bot.py."""
+"""Tests for pure (no-browser) functions in bot.py and config.py."""
 
 import sys
 from datetime import datetime
@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import bot  # noqa: E402
+import config  # noqa: E402
 
 
 class TestParseTime:
@@ -108,3 +109,44 @@ class TestPhantomBlacklistShape:
         blacklist = set()
         blacklist.add(("4/18/2026", "Lions", "9:00 AM"))
         assert ("4/18/2026", "Roy Kizer", "9:00 AM") not in blacklist
+
+
+class TestCourseConfig:
+    """Verify course configuration integrity."""
+
+    def test_course_codes_order(self):
+        """Courses should be searched in priority order: Lions > Roy Kizer > Jimmy Clay > Morris Williams."""
+        names = list(config.COURSE_CODES.values())
+        assert names == ["Lions", "Roy Kizer", "Jimmy Clay", "Morris Williams"]
+
+    def test_all_course_codes_are_strings(self):
+        for code, name in config.COURSE_CODES.items():
+            assert isinstance(code, str), f"Code for {name} should be string"
+            assert isinstance(name, str), f"Name for code {code} should be string"
+
+    def test_no_duplicate_course_codes(self):
+        codes = list(config.COURSE_CODES.keys())
+        assert len(codes) == len(set(codes))
+
+    def test_no_duplicate_course_names(self):
+        names = list(config.COURSE_CODES.values())
+        assert len(names) == len(set(names))
+
+
+class TestPlayerFallback:
+    def test_fallback_is_less_than_default(self):
+        assert config.FALLBACK_NUM_PLAYERS < config.NUM_PLAYERS
+
+    def test_fallback_is_at_least_1(self):
+        assert config.FALLBACK_NUM_PLAYERS is None or config.FALLBACK_NUM_PLAYERS >= 1
+
+    def test_default_is_4(self):
+        assert config.NUM_PLAYERS == 4
+
+    def test_fallback_is_2(self):
+        assert config.FALLBACK_NUM_PLAYERS == 2
+
+
+class TestNavRecoveryConstant:
+    def test_max_nav_recovery_attempts_is_positive(self):
+        assert bot.MAX_NAV_RECOVERY_ATTEMPTS >= 2

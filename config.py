@@ -5,21 +5,15 @@ BASE_URL = "https://txaustinweb.myvscloud.com/webtrac/web"
 SEARCH_URL = f"{BASE_URL}/search.html?display=detail&module=GR"
 LOGIN_URL = f"{BASE_URL}/login.html"
 
-# Course codes from Vermont Systems
-# These are the secondarycode values in the dropdown
-# Ordered by priority: Lions > Roy Kizer > Jimmy Clay
+# Course codes from Vermont Systems (secondarycode values in the dropdown).
+# Ordered by search priority: Lions > Roy Kizer > Jimmy Clay > Morris Williams.
+# Dict iteration order matters — the bot searches courses in this order.
 COURSE_CODES = {
     "4": "Lions",
     "2": "Roy Kizer",
     "1": "Jimmy Clay",
+    "3": "Morris Williams",
 }
-
-# Target courses in priority order
-TARGET_COURSES = [
-    "Roy Kizer",
-    "Lions",
-    "Jimmy Clay",
-]
 
 # Time preferences in order of priority
 TIME_PRIORITY = [
@@ -44,6 +38,10 @@ TIME_PRIORITY = [
 
 # Number of players (default; override with --players CLI flag)
 NUM_PLAYERS = 4
+
+# If no slots found for NUM_PLAYERS, retry with this many.
+# Set to None to disable the fallback.
+FALLBACK_NUM_PLAYERS = 2
 
 # Booking window (8am-1pm preferred)
 MIN_HOUR = 8   # 8 AM

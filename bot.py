@@ -28,6 +28,7 @@ except ImportError:
     stealth_sync = lambda page: Stealth().apply_stealth_sync(page)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_screenshots")
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
 from config import (
@@ -36,6 +37,7 @@ from config import (
     COURSE_CODES,
     TIME_PRIORITY,
     NUM_PLAYERS as DEFAULT_NUM_PLAYERS,
+    FALLBACK_NUM_PLAYERS,
     MIN_HOUR,
     MAX_HOUR,
     FALLBACK_MAX_HOUR,
@@ -91,6 +93,22 @@ def send_email(subject: str, body: str) -> None:
         print(f"Email sent: {subject}")
     except Exception as e:
         print(f"Failed to send email: {e}")
+
+
+# ======================================================================
+# Debug screenshots
+# ======================================================================
+
+def save_debug_screenshot(page, label: str) -> None:
+    """Save a screenshot for post-mortem debugging. Silently no-ops on failure."""
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(DEBUG_DIR, f"debug_{label}_{ts}.png")
+        page.screenshot(path=path, full_page=False)
+        print(f"  [debug] Screenshot saved: {path}")
+    except Exception as e:
+        print(f"  [debug] Screenshot failed ({label}): {e}")
 
 
 # ======================================================================
@@ -347,6 +365,7 @@ def login_once(page, queue_mode: str = "timeout") -> bool:
             except Exception:
                 pass
         print("  [login] FAILED: still on login page")
+        save_debug_screenshot(page, "login_failed")
         return False
 
     if not is_authenticated(page):
@@ -373,6 +392,7 @@ def login_with_retry(page, queue_mode: str = "timeout") -> bool:
             except Exception:
                 pass
     print(f"  Login failed after {MAX_LOGIN_RETRIES} attempts")
+    save_debug_screenshot(page, "login_exhausted")
     return False
 
 
@@ -380,38 +400,48 @@ def login_with_retry(page, queue_mode: str = "timeout") -> bool:
 # Navigation with Queue-it + session-expiry recovery
 # ======================================================================
 
+MAX_NAV_RECOVERY_ATTEMPTS = 3
+
+
 def navigate_to_search(page, url: str) -> bool:
     """Navigate to a search URL, handling Queue-it interception and session expiry.
 
     Returns True if we ended up on the target page authenticated. Any caller
     that uses page.goto() directly risks silently parsing a Queue-it waiting
     room page and seeing zero rows — always route through this helper.
+
+    Loops up to MAX_NAV_RECOVERY_ATTEMPTS times to handle chained failures
+    (e.g. Queue-it wait -> session expired -> Queue-it again).
     """
-    try:
-        page.goto(url, timeout=30000, wait_until="domcontentloaded")
-    except PlaywrightTimeout:
-        print("  [nav] goto timed out")
-        return False
-
-    if is_in_queue(page):
-        print("  [nav] Hit Queue-it — waiting through it")
-        if not wait_for_queue(page, mode="timeout"):
-            return False
+    for attempt in range(1, MAX_NAV_RECOVERY_ATTEMPTS + 1):
         try:
             page.goto(url, timeout=30000, wait_until="domcontentloaded")
         except PlaywrightTimeout:
+            print(f"  [nav] goto timed out (attempt {attempt})")
+            if attempt < MAX_NAV_RECOVERY_ATTEMPTS:
+                continue
             return False
 
-    if is_on_login_page(page):
-        print("  [nav] Session expired — re-authenticating")
-        if not login_with_retry(page, queue_mode="timeout"):
-            return False
-        try:
-            page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        except PlaywrightTimeout:
-            return False
+        if is_in_queue(page):
+            print("  [nav] Hit Queue-it — waiting through it")
+            if not wait_for_queue(page, mode="timeout"):
+                save_debug_screenshot(page, "nav_queue_timeout")
+                return False
+            continue  # re-navigate after queue release
 
-    return True
+        if is_on_login_page(page):
+            print("  [nav] Session expired — re-authenticating")
+            if not login_with_retry(page, queue_mode="timeout"):
+                save_debug_screenshot(page, "nav_relogin_failed")
+                return False
+            continue  # re-navigate after login
+
+        # Not in queue, not on login page — we're on the target page
+        return True
+
+    print(f"  [nav] Failed after {MAX_NAV_RECOVERY_ATTEMPTS} recovery attempts")
+    save_debug_screenshot(page, "nav_exhausted")
+    return False
 
 
 # ======================================================================
@@ -691,6 +721,7 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
             page.wait_for_timeout(REFRESH_BETWEEN_ROUNDS_MS)
         print(f"  {pass_label} pass exhausted for {day_name}")
 
+    save_debug_screenshot(page, f"no_slots_{day_name}")
     return {"success": False, "details": None, "course": None}
 
 
@@ -701,52 +732,56 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
 def run_booking_session(page, results: dict, saturday_date: str, sunday_date: str,
                          num_players: int, dry_run: bool,
                          skip_wait: bool, is_first_session: bool) -> bool:
-    """Single booking session. Browser/page is persisted by the caller."""
-    try:
-        queue_mode = "deadline" if (is_first_session and not skip_wait) else "timeout"
-        if queue_mode == "deadline":
-            print("\n*** QUEUE MODE: deadline (until 8:05 PM) ***\n")
+    """Single booking session. Browser/page is persisted by the caller.
 
-        if not login_with_retry(page, queue_mode=queue_mode):
-            print("Login failed — session will retry")
+    Lets page-death exceptions propagate so the outer loop can recreate the page.
+    """
+    queue_mode = "deadline" if (is_first_session and not skip_wait) else "timeout"
+    if queue_mode == "deadline":
+        print("\n*** QUEUE MODE: deadline (until 8:05 PM) ***\n")
+
+    if not login_with_retry(page, queue_mode=queue_mode):
+        print("Login failed — session will retry")
+        return False
+
+    if not skip_wait:
+        wait_until_release_time()
+
+    # After waking up at 8:00 PM, verify we're still logged in before searching
+    if not is_authenticated(page):
+        print("Session no longer authenticated after release-wait — re-authenticating")
+        if not login_with_retry(page, queue_mode="timeout"):
             return False
 
-        if not skip_wait:
-            wait_until_release_time()
+    blacklist: set = set()
 
-        # After waking up at 8:00 PM, verify we're still logged in before searching
-        if not is_authenticated(page):
-            print("Session no longer authenticated after release-wait — re-authenticating")
-            if not login_with_retry(page, queue_mode="timeout"):
-                return False
+    def course_of(result):
+        course = result.get("course")
+        return course if isinstance(course, str) else None
 
-        blacklist: set = set()
-
-        def course_of(result):
-            course = result.get("course")
-            return course if isinstance(course, str) else None
-
-        if not results["saturday"]["success"]:
-            print("\n=== BOOKING SATURDAY ===")
-            results["saturday"] = try_book_day(
-                page, saturday_date, "saturday", num_players, blacklist,
-                dry_run=dry_run,
+    def book_day(day_key, date, day_name, exclude_course=None):
+        if results[day_key]["success"]:
+            return
+        print(f"\n=== BOOKING {day_name.upper()} ===")
+        results[day_key] = try_book_day(
+            page, date, day_name, num_players, blacklist,
+            exclude_course=exclude_course, dry_run=dry_run,
+        )
+        # Player-count fallback: if no slots for num_players, retry with fewer
+        if (not results[day_key]["success"]
+                and FALLBACK_NUM_PLAYERS is not None
+                and FALLBACK_NUM_PLAYERS < num_players):
+            print(f"\n  === {day_name.upper()} / retrying with {FALLBACK_NUM_PLAYERS} players ===")
+            results[day_key] = try_book_day(
+                page, date, day_name, FALLBACK_NUM_PLAYERS, blacklist,
+                exclude_course=exclude_course, dry_run=dry_run,
             )
 
-        sat_course = course_of(results["saturday"])
+    book_day("saturday", saturday_date, "saturday")
+    book_day("sunday", sunday_date, "sunday",
+             exclude_course=course_of(results["saturday"]))
 
-        if not results["sunday"]["success"]:
-            print("\n=== BOOKING SUNDAY ===")
-            results["sunday"] = try_book_day(
-                page, sunday_date, "sunday", num_players, blacklist,
-                exclude_course=sat_course, dry_run=dry_run,
-            )
-
-        return results["saturday"]["success"] and results["sunday"]["success"]
-
-    except Exception as e:
-        print(f"Session error: {e}")
-        return False
+    return results["saturday"]["success"] and results["sunday"]["success"]
 
 
 def run_booking(args) -> dict:
@@ -774,6 +809,18 @@ def run_booking(args) -> dict:
         page = context.new_page()
         stealth_sync(page)
 
+        def new_page():
+            """Create a fresh page in the same browser context."""
+            nonlocal page
+            try:
+                page.close()
+            except Exception:
+                pass
+            page = context.new_page()
+            stealth_sync(page)
+            print("  [recovery] Created fresh browser page")
+            return page
+
         try:
             while True:
                 session_count += 1
@@ -790,13 +837,20 @@ def run_booking(args) -> dict:
                 print(f"SESSION {session_count} (elapsed: {int(elapsed)}s)")
                 print(f"{'=' * 50}")
 
-                done = run_booking_session(
-                    page, results, saturday_date, sunday_date,
-                    num_players=args.players,
-                    dry_run=args.dry_run,
-                    skip_wait=args.now,
-                    is_first_session=(session_count == 1),
-                )
+                try:
+                    done = run_booking_session(
+                        page, results, saturday_date, sunday_date,
+                        num_players=args.players,
+                        dry_run=args.dry_run,
+                        skip_wait=args.now,
+                        is_first_session=(session_count == 1),
+                    )
+                except Exception as e:
+                    # Page or browser context died — recover with a fresh page
+                    print(f"\n  [recovery] Session crashed: {e}")
+                    page = new_page()
+                    done = False
+
                 if done:
                     break
 

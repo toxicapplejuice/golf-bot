@@ -83,7 +83,8 @@ python3 -m pytest tests/ -q
 
 `tests/test_pure.py` covers pure functions (parse_time, is_time_in_range
 for both morning and fallback windows, get_time_priority ordering,
-get_next_weekend_dates, and the phantom blacklist tuple shape). 21 tests.
+get_next_weekend_dates, phantom blacklist tuple shape, course config
+integrity, and player-count fallback config). 30 tests.
 
 There are no browser-integration tests — the only way to verify the
 Playwright path is `--dry-run` against the live site.
@@ -91,9 +92,10 @@ Playwright path is `--dry-run` against the live site.
 ## Configuration
 
 `config.py` holds the static knobs:
-- `COURSE_CODES` — Vermont Systems secondarycode -> course name map
+- `COURSE_CODES` — Vermont Systems secondarycode -> course name map (Lions > Roy Kizer > Jimmy Clay > Morris Williams)
 - `TIME_PRIORITY` — ordered list of preferred tee times (9am > 8am > 10am > 11am > 12pm > 1pm > fallback afternoon)
 - `NUM_PLAYERS` — default 4
+- `FALLBACK_NUM_PLAYERS` — default 2; if no slots for NUM_PLAYERS, retry with this many. Set to None to disable.
 - `MIN_HOUR = 8`, `MAX_HOUR = 13` — primary search window (8am – 1pm inclusive)
 - `FALLBACK_MAX_HOUR = 17` — if morning pass finds nothing, widen to 5pm
 
@@ -113,18 +115,23 @@ NOTIFICATION_EMAIL=...
 ## How booking works
 
 1. `run_booking()` launches Firefox **once** and reuses the same page
-   across retries (so Queue-it progress is never thrown away).
+   across retries (so Queue-it progress is never thrown away). If the
+   page/browser dies mid-session, the outer loop creates a fresh page
+   and retries.
 2. `run_booking_session()` logs in, waits until 8:00 PM CT, re-verifies
    auth, then attempts Saturday then Sunday.
-3. `try_book_day()` runs a two-pass search: morning window first
+3. For each day: first try with `NUM_PLAYERS` (4). If no slots found
+   across all passes, retry with `FALLBACK_NUM_PLAYERS` (2).
+4. `try_book_day()` runs a two-pass search: morning window first
    (`MAX_HOUR=13`), then a fallback pass widening to `FALLBACK_MAX_HOUR=17`.
-4. For each (course, round, pass) combination, `search_and_book_course()`
-   navigates via `navigate_to_search()` (Queue-it + session-expiry safe)
-   and calls `attempt_booking_click()` on slots in priority order.
-5. Slots that return "In Use" or "Unavailable" are added to a session-
+5. For each (course, round, pass) combination, `search_and_book_course()`
+   navigates via `navigate_to_search()` (Queue-it + session-expiry safe,
+   loops up to 3 recovery attempts for chained failures) and calls
+   `attempt_booking_click()` on slots in priority order.
+6. Slots that return "In Use" or "Unavailable" are added to a session-
    scoped phantom blacklist `{(date, course, time)}` so the bot doesn't
    waste time retrying them.
-6. Sunday inherits a `exclude_course` hint from Saturday's successful
+7. Sunday inherits a `exclude_course` hint from Saturday's successful
    booking, so you don't accidentally book the same course both days.
 
 ## Debugging a failed run
@@ -133,8 +140,8 @@ NOTIFICATION_EMAIL=...
    tell you exactly which step failed.
 2. Look for `[queue]`, `[nav]`, `[login]`, `[search]`, `[book]` tags —
    each subsystem prefixes its output so grep works.
-3. Check `debug_homepage.png` and `debug_queue_signin.png` for visual
-   state at the moment of failure.
+3. Check `debug_screenshots/` for timestamped PNGs captured at failure
+   points (login failure, navigation exhaustion, no slots found).
 4. If the failure is Queue-it related, verify `is_in_queue()` signatures
    still match (Queue-it updates their HTML occasionally — strings like
    "you're in line", "virtual waiting room", "will be entering our site
