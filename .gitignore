@@ -5,3 +5,6 @@ __pycache__/
 *.png
 *.html
 booking.log
+.claude/
+.pytest_cache/
+
