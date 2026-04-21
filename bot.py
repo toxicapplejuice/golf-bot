@@ -147,22 +147,24 @@ def is_time_in_range(time_str: str, max_hour: int = MAX_HOUR) -> bool:
 
 
 def get_time_priority(time_str: str) -> int:
-    """Lower = better. Preferred order: 9:00-9:29 > 9:30-9:59 > 10:00-10:29 > ..."""
+    """Lower = better. Preferred order: 8:30am > 8am > 9am > 10am > ...
+
+    Times in TIME_PRIORITY get their list index (lower = better).
+    Unlisted times fall back to a bucket based on hour.
+    """
     if time_str in TIME_PRIORITY:
         return TIME_PRIORITY.index(time_str)
     minutes = parse_time(time_str)
-    hour, minute = minutes // 60, minutes % 60
-    if hour == 9 and minute < 30:
+    hour = minutes // 60
+    if hour == 8:
         return 5
     if hour == 9:
         return 10
-    if hour == 10 and minute < 30:
-        return 15
     if hour == 10:
         return 20
-    if hour == 8:
-        return 30
     if hour == 11:
+        return 30
+    if hour == 12:
         return 40
     return 100
 

@@ -16,11 +16,14 @@ COURSE_CODES = {
 }
 
 # Time preferences in order of priority
+# 8:30am block first, then 8am, then 9am, then the rest
 TIME_PRIORITY = [
+    # 8:30am block (top priority)
+    "8:32 AM", "8:24 AM", "8:40 AM", "8:16 AM", "8:48 AM",
+    # 8am block
+    "8:00 AM", "8:08 AM",
     # 9am block
     "9:00 AM", "9:08 AM", "9:16 AM", "9:24 AM", "9:32 AM", "9:40 AM", "9:48 AM",
-    # 8am block
-    "8:00 AM", "8:08 AM", "8:16 AM", "8:24 AM", "8:32 AM", "8:40 AM", "8:48 AM",
     # 10am block
     "10:00 AM", "10:08 AM", "10:16 AM", "10:24 AM", "10:32 AM", "10:40 AM", "10:48 AM",
     # 11am block

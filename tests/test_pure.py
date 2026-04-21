@@ -52,17 +52,18 @@ class TestIsTimeInRange:
 
 
 class TestGetTimePriority:
-    def test_9am_beats_other_hours(self):
-        """9am block has highest priority in TIME_PRIORITY list."""
-        nine = bot.get_time_priority("9:00 AM")
-        assert nine < bot.get_time_priority("8:00 AM")
-        assert nine < bot.get_time_priority("10:00 AM")
-        assert nine < bot.get_time_priority("11:00 AM")
+    def test_830am_is_top_priority(self):
+        """8:30am block has highest priority."""
+        eight_thirty = bot.get_time_priority("8:32 AM")
+        assert eight_thirty < bot.get_time_priority("8:00 AM")
+        assert eight_thirty < bot.get_time_priority("9:00 AM")
+        assert eight_thirty < bot.get_time_priority("10:00 AM")
 
     def test_ordering_matches_time_priority_list(self):
-        # 9am > 8am > 10am > 11am > 12pm > 1pm in the config
-        assert bot.get_time_priority("9:00 AM") < bot.get_time_priority("8:00 AM")
-        assert bot.get_time_priority("8:00 AM") < bot.get_time_priority("10:00 AM")
+        # 8:30am > 8am > 9am > 10am > 11am > 12pm in the config
+        assert bot.get_time_priority("8:32 AM") < bot.get_time_priority("8:00 AM")
+        assert bot.get_time_priority("8:00 AM") < bot.get_time_priority("9:00 AM")
+        assert bot.get_time_priority("9:00 AM") < bot.get_time_priority("10:00 AM")
         assert bot.get_time_priority("10:00 AM") < bot.get_time_priority("11:00 AM")
         assert bot.get_time_priority("11:00 AM") < bot.get_time_priority("12:00 PM")
 
