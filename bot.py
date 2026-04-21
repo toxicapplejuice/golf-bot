@@ -9,11 +9,13 @@ for Saturday/Sunday mornings when they release on Monday at 8pm CT.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import smtplib
 import sys
 import time
+import urllib.request
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -29,6 +31,7 @@ except ImportError:
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_screenshots")
+STATE_FILE = os.path.join(SCRIPT_DIR, "state.json")
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
 from config import (
@@ -68,6 +71,8 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 NOTIFICATION_EMAIL = os.getenv("NOTIFICATION_EMAIL")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC")  # e.g. "golfbot-michael-xyz123"
+NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
 
 
 # ======================================================================
@@ -76,7 +81,6 @@ NOTIFICATION_EMAIL = os.getenv("NOTIFICATION_EMAIL")
 
 def send_email(subject: str, body: str) -> None:
     if not all([SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD, NOTIFICATION_EMAIL]):
-        print("Email not configured, skipping notification")
         return
 
     msg = MIMEMultipart()
@@ -95,6 +99,43 @@ def send_email(subject: str, body: str) -> None:
         print(f"Failed to send email: {e}")
 
 
+def send_ntfy(title: str, message: str, priority: str = "default",
+              tags: str = None) -> None:
+    """Send a push notification via ntfy.sh.
+
+    priority: "min", "low", "default", "high", "urgent"
+    tags: comma-separated emoji tags, e.g. "golf,white_check_mark"
+    """
+    if not NTFY_TOPIC:
+        return
+    url = f"{NTFY_SERVER.rstrip('/')}/{NTFY_TOPIC}"
+    headers = {
+        "Title": title,
+        "Priority": priority,
+    }
+    if tags:
+        headers["Tags"] = tags
+    try:
+        req = urllib.request.Request(
+            url, data=message.encode("utf-8"), headers=headers, method="POST"
+        )
+        urllib.request.urlopen(req, timeout=10)
+        print(f"ntfy sent: {title}")
+    except Exception as e:
+        print(f"Failed to send ntfy: {e}")
+
+
+def notify(title: str, message: str, priority: str = "default",
+           tags: str = None) -> None:
+    """Send notifications via all configured channels (ntfy + email)."""
+    send_ntfy(title, message, priority=priority, tags=tags)
+    # Email as fallback/additional
+    if SMTP_SERVER:
+        send_email(title, message)
+    # Always print to log
+    print(f"\n=== NOTIFY: {title} ===\n{message}\n===")
+
+
 # ======================================================================
 # Debug screenshots
 # ======================================================================
@@ -109,6 +150,61 @@ def save_debug_screenshot(page, label: str) -> None:
         print(f"  [debug] Screenshot saved: {path}")
     except Exception as e:
         print(f"  [debug] Screenshot failed ({label}): {e}")
+
+
+# ======================================================================
+# State persistence (resume-on-crash)
+# ======================================================================
+
+def load_state(saturday_date: str, sunday_date: str) -> dict:
+    """Load saved booking state for the current weekend. Returns empty if
+    state is stale (different weekend) or missing."""
+    empty = {
+        "saturday": {"success": False, "details": None, "course": None},
+        "sunday": {"success": False, "details": None, "course": None},
+    }
+    try:
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return empty
+
+    # Stale check: only use state if it matches this weekend
+    if state.get("saturday_date") != saturday_date or state.get("sunday_date") != sunday_date:
+        print(f"  [state] Existing state is for a different weekend — ignoring")
+        return empty
+
+    if state.get("results"):
+        sat = state["results"].get("saturday", {})
+        sun = state["results"].get("sunday", {})
+        if sat.get("success") or sun.get("success"):
+            print(f"  [state] Resuming: Sat={sat.get('details') or 'pending'}, "
+                  f"Sun={sun.get('details') or 'pending'}")
+            return state["results"]
+    return empty
+
+
+def save_state(saturday_date: str, sunday_date: str, results: dict) -> None:
+    """Save booking state so a crashed run can resume."""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({
+                "saturday_date": saturday_date,
+                "sunday_date": sunday_date,
+                "saved_at": datetime.now().isoformat(),
+                "results": results,
+            }, f, indent=2)
+    except Exception as e:
+        print(f"  [state] Save failed: {e}")
+
+
+def clear_state() -> None:
+    """Clear state file after a fully successful run (both days booked)."""
+    try:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+    except Exception:
+        pass
 
 
 # ======================================================================
@@ -532,13 +628,88 @@ def extract_available_slots(page, course_code: str, course_name: str, date: str,
 TAKEN_KEYWORDS = [
     "already taken", "no longer available", "not available",
     "already booked", "sold out", "taken by another", "in use",
+    "already reserved", "no longer open", "has been reserved",
+    "time slot is full", "maximum number", "duplicate",
+    "invalid selection", "encountered the following restrictions",
+    "limit one tee time", "tee time per fm",
 ]
+
+# Positive confirmation signals — at least one must be present to count as booked.
+# Without a positive signal, we assume the booking did NOT go through.
+BOOKED_URL_MARKERS = ("confirmation", "receipt", "complete", "finishaddtocart")
+BOOKED_TEXT_MARKERS = (
+    "receipt number", "confirmation number", "booking confirmed",
+    "has been added", "successfully reserved", "reservation confirmed",
+    "thank you for your reservation", "tee time confirmation",
+)
+
+# Reservation history page — used for post-booking verification
+HISTORY_URL = f"{BASE_URL}/history.html?historyoption=inquiry"
+
+
+def verify_booking_on_page(page, slot: dict, page_text: str) -> bool:
+    """Quick first-pass verification: does the current page reference our slot?"""
+    time_lower = slot["time"].lower().replace(" ", "")
+    course_lower = slot["course"].lower()
+    # The receipt page shows time like "8:01A" or "8:01 AM" — normalize both
+    page_normalized = page_text.replace(" ", "").replace(":", ":")
+    time_found = time_lower in page_normalized or slot["time"].lower() in page_text
+    course_found = course_lower in page_text
+    return time_found and course_found
+
+
+def verify_booking_via_history(page, slot: dict) -> bool:
+    """Definitive verification: navigate to reservation history page and look for slot.
+
+    This is the ground-truth check — if the booking doesn't appear here, it didn't happen.
+    """
+    try:
+        page.goto(HISTORY_URL, timeout=15000, wait_until="domcontentloaded")
+    except PlaywrightTimeout:
+        print(f"    [verify] History page timeout — assuming booking failed")
+        return False
+
+    # If we got redirected to login or queue, something's wrong
+    if is_on_login_page(page) or is_in_queue(page):
+        print(f"    [verify] Lost session during verification — assuming booking failed")
+        return False
+
+    try:
+        content = page.content().lower()
+    except Exception:
+        return False
+
+    # Look for slot time, course, and date
+    time_lower = slot["time"].lower()
+    course_lower = slot["course"].lower()
+    date_str = slot["date"]  # e.g. "4/25/2026"
+
+    # Normalize date variations: site might show "04/25/2026" or "4/25/2026"
+    date_parts = date_str.split("/")
+    date_padded = f"{date_parts[0].zfill(2)}/{date_parts[1].zfill(2)}/{date_parts[2]}"
+
+    date_found = date_str in content or date_padded in content
+    time_found = time_lower in content
+
+    # Time on receipt can be "8:01A" instead of "8:01 AM" — also check condensed form
+    time_condensed = slot["time"].replace(" AM", "A").replace(" PM", "P").lower()
+    time_found = time_found or time_condensed in content
+
+    course_found = course_lower in content
+
+    print(f"    [verify] history check — date:{date_found} time:{time_found} course:{course_found}")
+    return date_found and time_found and course_found
 
 
 def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
     """Click cart button for a slot and determine result.
 
     Returns one of: 'booked', 'taken', 'dry_run', 'session_expired', 'failed'.
+
+    IMPORTANT: only returns 'booked' if a positive confirmation signal is found
+    (receipt/confirmation URL or confirmation text on page). Never assumes
+    "not on search page = booked" — that caused false positives when the slot
+    was already taken and the site showed an error page we didn't recognize.
     """
     target_row = None
     for row in page.locator("tr:has-text('Available')").all():
@@ -579,17 +750,19 @@ def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
     except PlaywrightTimeout:
         pass
 
-    current_url = page.url
-    if current_url == pre_url or "search.html" in current_url.lower():
+    current_url = page.url.lower()
+    if current_url == pre_url or "search.html" in current_url:
         return "taken"
 
-    if "login.html" in current_url.lower():
+    if "login.html" in current_url:
         return "session_expired"
 
     if dry_run:
-        print(f"    [dry-run] Reached {current_url[:60]} — aborting before checkout")
+        print(f"    [dry-run] Reached {page.url[:60]} — aborting before checkout")
         return "dry_run"
 
+    # We should be on addtocart.html now — click "One Click Finish" to complete
+    clicked_finish = False
     for sel in (
         "button:has-text('One Click')",
         "a:has-text('One Click')",
@@ -600,6 +773,7 @@ def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
             btn = page.locator(sel).first
             if btn.count() > 0 and btn.is_visible():
                 btn.click(timeout=10000)
+                clicked_finish = True
                 try:
                     page.wait_for_load_state("domcontentloaded", timeout=10000)
                 except PlaywrightTimeout:
@@ -614,20 +788,41 @@ def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
     except Exception:
         page_text = ""
 
+    # Check for "taken" signals first — these are definitive
     if any(kw in page_text for kw in TAKEN_KEYWORDS):
+        print(f"    [book] Slot taken (keyword match on page)")
         return "taken"
-
-    if any(marker in final_url for marker in ("confirmation", "receipt", "complete")):
-        return "booked"
-    if any(marker in page_text for marker in ("receipt number", "confirmation number", "booking confirmed")):
-        return "booked"
 
     if "login.html" in final_url:
         return "session_expired"
 
-    if "search.html" not in final_url:
-        return "booked"
+    # Check for POSITIVE confirmation signals — require at least one
+    has_url_marker = any(marker in final_url for marker in BOOKED_URL_MARKERS)
+    has_text_marker = any(marker in page_text for marker in BOOKED_TEXT_MARKERS)
 
+    if has_url_marker or has_text_marker:
+        # VERIFY: the confirmation page should reference our specific slot.
+        # Receipt pages show course name and time — check they match.
+        if verify_booking_on_page(page, slot, page_text):
+            return "booked"
+        else:
+            # Confirmation URL/text but slot info missing — suspicious
+            print(f"    [book] Confirmation page shown but slot not verified")
+            save_debug_screenshot(page, f"unverified_{slot['time'].replace(' ', '_')}")
+            return "failed"
+
+    # If we're still on addtocart.html, the checkout didn't complete
+    if "addtocart" in final_url:
+        if not clicked_finish:
+            print(f"    [book] On cart page but couldn't find 'One Click Finish' button")
+        else:
+            print(f"    [book] Clicked finish but still on cart page — slot likely taken")
+        save_debug_screenshot(page, f"cart_stuck_{slot['time'].replace(' ', '_')}")
+        return "failed"
+
+    # Unknown page — do NOT assume booked. Screenshot for debugging.
+    print(f"    [book] Ambiguous outcome (URL: {page.url[:60]})")
+    save_debug_screenshot(page, f"ambiguous_{slot['time'].replace(' ', '_')}")
     return "failed"
 
 
@@ -664,12 +859,23 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
         status = attempt_booking_click(page, slot, dry_run=dry_run)
 
         if status == "booked":
-            print("BOOKED!")
-            return {
-                "success": True,
-                "details": f"{slot['time']} at {course_name}",
-                "course": course_name,
-            }
+            print("BOOKED! — verifying...", end=" ", flush=True)
+            # Ground-truth check: navigate to reservation history and confirm
+            if verify_booking_via_history(page, slot):
+                print("VERIFIED ✓")
+                return {
+                    "success": True,
+                    "details": f"{slot['time']} at {course_name}",
+                    "course": course_name,
+                }
+            else:
+                print("VERIFICATION FAILED — treating as not booked")
+                save_debug_screenshot(page, f"verify_failed_{slot['time'].replace(' ', '_')}")
+                blacklist.add(key)
+                # Re-navigate to search page to continue trying other slots
+                if not navigate_to_search(page, url):
+                    break
+                continue
 
         if status == "dry_run":
             print("DRY-RUN OK")
@@ -763,6 +969,7 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
 
     def book_day(day_key, date, day_name, exclude_course=None):
         if results[day_key]["success"]:
+            print(f"\n=== {day_name.upper()} already booked from prior session — skipping ===")
             return
         print(f"\n=== BOOKING {day_name.upper()} ===")
         results[day_key] = try_book_day(
@@ -778,6 +985,9 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
                 page, date, day_name, FALLBACK_NUM_PLAYERS, blacklist,
                 exclude_course=exclude_course, dry_run=dry_run,
             )
+        # Persist state after each day — survives a crash mid-run
+        if results[day_key]["success"]:
+            save_state(saturday_date, sunday_date, results)
 
     book_day("saturday", saturday_date, "saturday")
     book_day("sunday", sunday_date, "sunday",
@@ -788,16 +998,18 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
 
 def run_booking(args) -> dict:
     """Main routine. Browser is launched once and persisted across session retries."""
-    results = {
-        "saturday": {"success": False, "details": None, "course": None},
-        "sunday": {"success": False, "details": None, "course": None},
-    }
-
     if not USERNAME or not PASSWORD:
         print("ERROR: Missing GOLF_USERNAME / GOLF_PASSWORD in .env")
-        return results
+        return {
+            "saturday": {"success": False, "details": None, "course": None},
+            "sunday": {"success": False, "details": None, "course": None},
+        }
 
     saturday_date, sunday_date = get_next_weekend_dates()
+
+    # Load prior state — lets a crashed run resume instead of redoing work
+    results = load_state(saturday_date, sunday_date)
+
     print(f"Target dates: Saturday {saturday_date}, Sunday {sunday_date}")
     print(f"Players: {args.players} | Max time: {args.max_time}s | "
           f"Dry run: {args.dry_run} | Headful: {args.headful}")
@@ -878,7 +1090,28 @@ def run_booking(args) -> dict:
         else:
             subject_parts.append(f"{name[:3]}: FAILED")
             body_lines.append(f"{name}: No booking made")
-    send_email(f"Golf Bot: {' | '.join(subject_parts)}", "\n".join(body_lines))
+
+    both_booked = results["saturday"]["success"] and results["sunday"]["success"]
+    any_booked = results["saturday"]["success"] or results["sunday"]["success"]
+
+    if both_booked:
+        title = "🏌️ Golf Bot: Both days booked!"
+        tags = "golf,white_check_mark"
+        priority = "default"
+    elif any_booked:
+        title = "⚠️ Golf Bot: Partial success"
+        tags = "golf,warning"
+        priority = "high"
+    else:
+        title = "❌ Golf Bot: No bookings made"
+        tags = "golf,x"
+        priority = "high"
+
+    notify(title, "\n".join(body_lines), priority=priority, tags=tags)
+
+    # Clear state if fully successful — fresh start next week
+    if both_booked:
+        clear_state()
 
     return results
 
@@ -889,14 +1122,18 @@ def run_booking(args) -> dict:
 
 def check_env() -> bool:
     required = ["GOLF_USERNAME", "GOLF_PASSWORD"]
-    optional = ["SMTP_SERVER", "SMTP_USERNAME", "SMTP_PASSWORD", "NOTIFICATION_EMAIL"]
+    email_keys = ["SMTP_SERVER", "SMTP_USERNAME", "SMTP_PASSWORD", "NOTIFICATION_EMAIL"]
     missing = [k for k in required if not os.getenv(k)]
-    present_optional = [k for k in optional if os.getenv(k)]
     if missing:
         print(f"  Required env: MISSING {', '.join(missing)}")
         return False
     print(f"  Required env: OK")
-    print(f"  Email config: {'enabled' if len(present_optional) == len(optional) else 'disabled'}")
+    email_on = all(os.getenv(k) for k in email_keys)
+    ntfy_on = bool(NTFY_TOPIC)
+    notifications = []
+    if ntfy_on: notifications.append("ntfy")
+    if email_on: notifications.append("email")
+    print(f"  Notifications: {', '.join(notifications) if notifications else 'DISABLED'}")
     return True
 
 

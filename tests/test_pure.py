@@ -151,3 +151,65 @@ class TestPlayerFallback:
 class TestNavRecoveryConstant:
     def test_max_nav_recovery_attempts_is_positive(self):
         assert bot.MAX_NAV_RECOVERY_ATTEMPTS >= 2
+
+
+class TestStatePersistence:
+    """State file should only be used for the current weekend, and should
+    round-trip cleanly through save/load."""
+
+    def setup_method(self):
+        # Use a temp state file for isolation
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_state = bot.STATE_FILE
+        bot.STATE_FILE = f"{self._tmpdir}/state.json"
+
+    def teardown_method(self):
+        import shutil
+        bot.STATE_FILE = self._orig_state
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_load_missing_file_returns_empty(self):
+        state = bot.load_state("4/25/2026", "4/26/2026")
+        assert state["saturday"]["success"] is False
+        assert state["sunday"]["success"] is False
+
+    def test_save_and_load_roundtrip(self):
+        results = {
+            "saturday": {"success": True, "details": "8:00 AM at Lions", "course": "Lions"},
+            "sunday": {"success": False, "details": None, "course": None},
+        }
+        bot.save_state("4/25/2026", "4/26/2026", results)
+        loaded = bot.load_state("4/25/2026", "4/26/2026")
+        assert loaded["saturday"]["success"] is True
+        assert loaded["saturday"]["details"] == "8:00 AM at Lions"
+        assert loaded["sunday"]["success"] is False
+
+    def test_stale_state_ignored(self):
+        """State from a different weekend should not be loaded."""
+        results = {
+            "saturday": {"success": True, "details": "8:00 AM at Lions", "course": "Lions"},
+            "sunday": {"success": True, "details": "9:00 AM at Roy Kizer", "course": "Roy Kizer"},
+        }
+        bot.save_state("4/11/2026", "4/12/2026", results)
+        loaded = bot.load_state("4/25/2026", "4/26/2026")
+        assert loaded["saturday"]["success"] is False
+        assert loaded["sunday"]["success"] is False
+
+    def test_clear_state_removes_file(self):
+        results = {"saturday": {"success": True, "details": "x", "course": "x"},
+                   "sunday": {"success": False, "details": None, "course": None}}
+        bot.save_state("4/25/2026", "4/26/2026", results)
+        import os
+        assert os.path.exists(bot.STATE_FILE)
+        bot.clear_state()
+        assert not os.path.exists(bot.STATE_FILE)
+
+
+class TestNotificationConfig:
+    def test_notify_no_ops_without_channels(self, monkeypatch):
+        """notify() should silently no-op when no channels are configured."""
+        monkeypatch.setattr(bot, "NTFY_TOPIC", None)
+        monkeypatch.setattr(bot, "SMTP_SERVER", None)
+        # Should not raise
+        bot.notify("test", "body")

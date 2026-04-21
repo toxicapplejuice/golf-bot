@@ -8,3 +8,4 @@ booking.log
 .claude/
 .pytest_cache/
 
+state.json

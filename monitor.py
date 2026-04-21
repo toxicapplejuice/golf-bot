@@ -91,6 +91,10 @@ HTML = """<!DOCTYPE html>
 
 <div class="cards">
   <div class="card">
+    <div class="card-label">Current Phase</div>
+    <div class="card-value" id="phase" style="font-size:16px">Waiting to start</div>
+  </div>
+  <div class="card">
     <div class="card-label">Saturday</div>
     <div class="card-value pending" id="satResult">--</div>
   </div>
@@ -99,8 +103,12 @@ HTML = """<!DOCTYPE html>
     <div class="card-value pending" id="sunResult">--</div>
   </div>
   <div class="card">
-    <div class="card-label">Session</div>
-    <div class="card-value" id="sessionNum">--</div>
+    <div class="card-label">Players</div>
+    <div class="card-value" id="players">--</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Countdown</div>
+    <div class="card-value" id="countdown" style="font-size:16px">--</div>
   </div>
   <div class="card">
     <div class="card-label">Last Update</div>
@@ -137,13 +145,58 @@ function parseResults(lines) {
   let sat = '--', sun = '--', session = '--';
   let satClass = 'pending', sunClass = 'pending';
   let isRunning = false;
+  let phase = 'Waiting to start';
+  let phaseClass = '';
+  let countdown = '--';
+  let players = '--';
 
   for (const line of lines) {
     const t = line.toLowerCase();
 
+    // Session tracking
     const sessionMatch = line.match(/SESSION (\\d+)/);
     if (sessionMatch) { session = '#' + sessionMatch[1]; isRunning = true; }
 
+    // Players
+    const playerMatch = line.match(/Players:\\s*(\\d+)/);
+    if (playerMatch) { players = playerMatch[1]; }
+
+    // Fallback player detection
+    if (t.includes('retrying with') && t.includes('players')) {
+      const fbMatch = line.match(/retrying with (\\d+) players/i);
+      if (fbMatch) players = fbMatch[1] + ' (fallback)';
+    }
+
+    // Phase detection — later lines overwrite earlier ones
+    if (t.includes('austin golf tee time')) { phase = 'Starting up'; phaseClass = ''; }
+    if (t.includes('logging in')) { phase = 'Logging in'; phaseClass = 'pending'; }
+    if (t.includes('[login] success')) { phase = 'Logged in'; phaseClass = 'booked'; }
+    if (t.includes('login failed') || t.includes('[login] failed')) { phase = 'Login failed'; phaseClass = 'failed'; }
+    if (t.includes('[queue]') && t.includes('waiting')) { phase = 'In waiting room'; phaseClass = 'pending'; }
+    if (t.includes('[queue]') && t.includes('still waiting')) { phase = 'In waiting room'; phaseClass = 'pending'; }
+    if (t.includes('[queue]') && t.includes('released')) { phase = 'Through waiting room'; phaseClass = 'booked'; }
+    if (t.includes('waiting until') && t.includes('release')) { phase = 'Waiting for 8:00 PM'; phaseClass = 'pending'; }
+    if (t.includes('release time reached')) { phase = 'Searching for tee times'; phaseClass = 'booked'; }
+    if (t.includes('already past release')) { phase = 'Searching for tee times'; phaseClass = 'booked'; }
+    if (t.includes('booking saturday')) { phase = 'Searching Saturday'; phaseClass = 'pending'; }
+    if (t.includes('booking sunday')) { phase = 'Searching Sunday'; phaseClass = 'pending'; }
+    if (t.includes('morning pass')) { phase = phase.split(' —')[0] + ' — morning'; phaseClass = 'pending'; }
+    if (t.includes('fallback pass')) { phase = phase.split(' —')[0] + ' — afternoon'; phaseClass = 'pending'; }
+    if (t.includes('[recovery]')) { phase = 'Recovering...'; phaseClass = 'failed'; }
+    if (t.includes('final results')) { phase = 'Done'; phaseClass = 'booked'; }
+    if (t.includes('max time') && t.includes('exceeded')) { phase = 'Timed out'; phaseClass = 'failed'; }
+
+    // Countdown to release
+    const countdownMatch = line.match(/(\\d+)s until release/);
+    if (countdownMatch) {
+      const secs = parseInt(countdownMatch[1]);
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      countdown = m + ':' + String(s).padStart(2, '0');
+    }
+    if (t.includes('release time reached') || t.includes('already past release')) { countdown = 'GO!'; }
+
+    // Saturday/Sunday results
     if (t.includes('saturday') && t.includes('success')) {
       const detail = line.match(/SUCCESS.*?[—-]\\s*(.+)/);
       sat = detail ? detail[1].trim() : 'Booked'; satClass = 'booked';
@@ -156,12 +209,24 @@ function parseResults(lines) {
     if (t.includes('sunday') && t.includes('no booking')) { sun = 'No booking'; sunClass = 'failed'; }
 
     // In-progress detection
-    if (t.includes('booking saturday') && sat === '--') { sat = 'Searching...'; }
-    if (t.includes('booking sunday') && sun === '--') { sun = 'Searching...'; }
-    if (t.includes('booked!') && t.includes('saturday')) { satClass = 'booked'; }
+    if (t.includes('booking saturday') && sat === '--') { sat = 'Searching...'; satClass = 'pending'; }
+    if (t.includes('booking sunday') && sun === '--') { sun = 'Searching...'; sunClass = 'pending'; }
+
+    // Booked mid-log (before final results)
+    if (t.includes('booked!')) {
+      const bookDetail = line.match(/\\[book\\]\\s*(.+?)\\.\\.\\./i);
+      if (bookDetail) {
+        // Figure out which day based on current phase
+        if (phase.toLowerCase().includes('sunday')) {
+          sun = bookDetail[1].trim() + ' ✓'; sunClass = 'booked';
+        } else {
+          sat = bookDetail[1].trim() + ' ✓'; satClass = 'booked';
+        }
+      }
+    }
   }
 
-  return { sat, sun, satClass, sunClass, session, isRunning };
+  return { sat, sun, satClass, sunClass, session, isRunning, phase, phaseClass, countdown, players };
 }
 
 async function refresh() {
@@ -169,6 +234,8 @@ async function refresh() {
     const resp = await fetch('/api/log');
     const data = await resp.json();
     const lines = data.lines;
+
+    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
 
     if (lines.length === 0) return;
 
@@ -182,23 +249,36 @@ async function refresh() {
       container.scrollTop = container.scrollHeight;
 
       document.getElementById('lineCount').textContent = lines.length + ' lines';
-      document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
 
       const r = parseResults(lines);
       const satEl = document.getElementById('satResult');
       const sunEl = document.getElementById('sunResult');
       satEl.textContent = r.sat; satEl.className = 'card-value ' + r.satClass;
       sunEl.textContent = r.sun; sunEl.className = 'card-value ' + r.sunClass;
-      document.getElementById('sessionNum').textContent = r.session;
+
+      const phaseEl = document.getElementById('phase');
+      phaseEl.textContent = r.phase;
+      phaseEl.className = 'card-value ' + (r.phaseClass || '');
+
+      document.getElementById('players').textContent = r.players;
+      document.getElementById('countdown').textContent = r.countdown;
 
       const dot = document.getElementById('statusDot');
       const statusText = document.getElementById('statusText');
 
-      const lastLine = lines[lines.length - 1].toLowerCase();
-      if (lastLine.includes('final results')) {
+      if (r.phase === 'Done') {
         const allBooked = r.satClass === 'booked' && r.sunClass === 'booked';
         dot.className = 'status-dot ' + (allBooked ? 'success' : 'failed');
         statusText.textContent = allBooked ? 'Both days booked!' : 'Finished';
+      } else if (r.phase === 'Timed out') {
+        dot.className = 'status-dot failed';
+        statusText.textContent = 'Timed out';
+      } else if (r.phase === 'In waiting room') {
+        dot.className = 'status-dot active';
+        statusText.textContent = 'In Queue-it waiting room...';
+      } else if (r.phase.includes('Waiting for 8')) {
+        dot.className = 'status-dot active';
+        statusText.textContent = 'Waiting for tee time release...';
       } else if (r.isRunning) {
         dot.className = 'status-dot active';
         statusText.textContent = 'Bot is running...';
