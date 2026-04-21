@@ -368,7 +368,11 @@ async function refreshAccounts() {
       return;
     }
     empty.style.display = 'none';
-    if (container.querySelectorAll('.account-card').length !== accounts.length) {
+    // Rebuild if the set of account IDs changed (covers count changes AND renames)
+    const currentIds = [...container.querySelectorAll('.account-card')]
+      .map(el => el.dataset.accountId).join(',');
+    const newIds = accounts.map(a => a.id).join(',');
+    if (currentIds !== newIds) {
       container.innerHTML = accounts.map(buildAccountCard).join('');
     }
   } catch (e) {}
