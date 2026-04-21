@@ -30,11 +30,26 @@ except ImportError:
     from playwright_stealth import Stealth
     stealth_sync = lambda page: Stealth().apply_stealth_sync(page)
 
+# Multi-account coordination. Safe to import unconditionally — if the bot is
+# run single-account, the shared-state calls just claim against an empty file.
+import shared_state
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_screenshots")
+ACCOUNTS_FILE = os.path.join(SCRIPT_DIR, "accounts.json")
+
+# Default per-account paths use the account id as suffix. The single-account
+# legacy names (state.json, booking.log, live.png) remain the defaults for
+# backward compatibility when no --account-id is passed.
 STATE_FILE = os.path.join(SCRIPT_DIR, "state.json")
 HISTORY_FILE = os.path.join(SCRIPT_DIR, "history.json")
 HISTORY_MAX_ENTRIES = 50
+
+# Active account context. Populated at startup by configure_account_context()
+# using --account-id (or the .env fallback for backward compat).
+ACCOUNT_ID: str = "default"
+ACCOUNT_DISPLAY_NAME: str = "Golf Bot"
+
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
 from config import (
@@ -67,6 +82,8 @@ REFRESH_BETWEEN_ROUNDS_MS = 500
 
 MAX_SEARCH_ROUNDS_PER_PASS = 3
 
+# Credentials default to the .env values. configure_account_context() overrides
+# these at startup when an --account-id flag selects a different accounts.json entry.
 USERNAME = os.getenv("GOLF_USERNAME")
 PASSWORD = os.getenv("GOLF_PASSWORD")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
@@ -76,6 +93,94 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 NOTIFICATION_EMAIL = os.getenv("NOTIFICATION_EMAIL")
 NTFY_TOPIC = os.getenv("NTFY_TOPIC")  # e.g. "golfbot-michael-xyz123"
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
+
+
+# ======================================================================
+# Account loading + per-account path configuration
+# ======================================================================
+
+def load_accounts() -> list:
+    """Load accounts.json if it exists. Returns a list of account dicts
+    with enabled accounts only (filters out entries with disabled=True)."""
+    if not os.path.exists(ACCOUNTS_FILE):
+        return []
+    try:
+        with open(ACCOUNTS_FILE, "r") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    # Validate shape and filter out disabled
+    valid = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        if not all(k in entry for k in ("id", "username", "password")):
+            continue
+        if entry.get("disabled"):
+            continue
+        if entry.get("username") == "REPLACE_ME" or entry.get("password") == "REPLACE_ME":
+            continue
+        entry.setdefault("display_name", entry["id"])
+        valid.append(entry)
+    return valid
+
+
+def get_account_by_id(account_id: str) -> dict | None:
+    """Return the account dict with matching id, or None."""
+    for entry in load_accounts():
+        if entry.get("id") == account_id:
+            return entry
+    return None
+
+
+def configure_account_context(account_id: str | None) -> dict:
+    """Set module-level credentials and per-account file paths.
+
+    If account_id is None, use the legacy .env defaults (single-account mode).
+    If account_id is given, look it up in accounts.json and switch credentials
+    + file paths to that account's namespace.
+
+    Returns the active account dict so callers can access display_name.
+    """
+    global USERNAME, PASSWORD, ACCOUNT_ID, ACCOUNT_DISPLAY_NAME
+    global STATE_FILE, LIVE_SCREENSHOT, BOOKING_LOG_PATH
+
+    if account_id is None:
+        # Legacy single-account mode — keep current behavior
+        account = {
+            "id": "default",
+            "display_name": "Golf Bot",
+            "username": USERNAME,
+            "password": PASSWORD,
+        }
+    else:
+        found = get_account_by_id(account_id)
+        if not found:
+            raise SystemExit(
+                f"Account id {account_id!r} not found in {ACCOUNTS_FILE}. "
+                "Check the file for a matching entry (and ensure it isn't "
+                "disabled or using REPLACE_ME credentials)."
+            )
+        account = found
+        USERNAME = account["username"]
+        PASSWORD = account["password"]
+        ACCOUNT_ID = account["id"]
+        ACCOUNT_DISPLAY_NAME = account.get("display_name", account["id"])
+        # Per-account file paths
+        STATE_FILE = os.path.join(SCRIPT_DIR, f"state_{account['id']}.json")
+        LIVE_SCREENSHOT = os.path.join(DEBUG_DIR, f"live_{account['id']}.png")
+        BOOKING_LOG_PATH = os.path.join(SCRIPT_DIR, f"booking_{account['id']}.log")
+
+    return account
+
+
+def live_label_path() -> str:
+    """Per-account live-screenshot label path. Derived at call time so it
+    works whether or not configure_account_context has run."""
+    suffix = f"_{ACCOUNT_ID}" if ACCOUNT_ID != "default" else ""
+    return os.path.join(DEBUG_DIR, f"live_label{suffix}.txt")
 
 
 # ======================================================================
@@ -179,9 +284,11 @@ class Watchdog:
     is thread-safe (we never touch the Playwright page from here).
     """
 
-    def __init__(self, log_path: str = BOOKING_LOG_PATH,
+    def __init__(self, log_path: str = None,
                  stall_seconds: int = WATCHDOG_STALL_SECONDS):
-        self.log_path = log_path
+        # log_path defaults to the module-level BOOKING_LOG_PATH at instantiation
+        # time (not at class definition time) so per-account overrides work.
+        self.log_path = log_path or BOOKING_LOG_PATH
         self.stall_seconds = stall_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread = None
@@ -225,7 +332,7 @@ def update_live_screenshot(page, label: str = "") -> None:
         os.makedirs(DEBUG_DIR, exist_ok=True)
         page.screenshot(path=LIVE_SCREENSHOT, full_page=False, timeout=3000)
         # Also write a label file for the dashboard to display
-        with open(os.path.join(DEBUG_DIR, "live_label.txt"), "w") as f:
+        with open(live_label_path(), "w") as f:
             f.write(f"{datetime.now().strftime('%H:%M:%S')} — {label}")
     except Exception:
         pass  # screenshots must never block booking
@@ -233,7 +340,7 @@ def update_live_screenshot(page, label: str = "") -> None:
 
 def clear_live_screenshot() -> None:
     """Remove the live snapshot when the bot finishes so the dashboard shows 'idle'."""
-    for path in (LIVE_SCREENSHOT, os.path.join(DEBUG_DIR, "live_label.txt")):
+    for path in (LIVE_SCREENSHOT, live_label_path()):
         try:
             if os.path.exists(path):
                 os.remove(path)
@@ -323,6 +430,8 @@ def append_to_history(saturday_date: str, sunday_date: str, results: dict,
         "weekend": f"{saturday_date} - {sunday_date}",
         "saturday_date": saturday_date,
         "sunday_date": sunday_date,
+        "account_id": ACCOUNT_ID,
+        "account_name": ACCOUNT_DISPLAY_NAME,
         "results": results,
     }
     if notes:
@@ -967,8 +1076,15 @@ def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
 
 def search_and_book_course(page, course_code: str, course_name: str, date: str,
                             num_players: int, max_hour: int, blacklist: set,
-                            dry_run: bool = False) -> dict:
-    """Search one course and try to book the best available slot."""
+                            dry_run: bool = False,
+                            weekend: str = None, day_name: str = None) -> dict:
+    """Search one course and try to book the best available slot.
+
+    `weekend` and `day_name` enable multi-account shared-state coordination.
+    When a booking verifies successfully, we claim the slot in shared_state.json
+    so other accounts stop trying the same day. If the claim fails (another
+    account just won), we mark the booking as a duplicate and warn the user.
+    """
     result = {"success": False, "details": None, "course": None}
     url = build_search_url(course_code, date, num_players)
 
@@ -1001,9 +1117,27 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
             # Ground-truth check: navigate to reservation history and confirm
             if verify_booking_via_history(page, slot):
                 print("VERIFIED ✓")
+                details = f"{slot['time']} at {course_name}"
+                # Multi-account coordination: claim this day so other accounts stop.
+                if weekend and day_name:
+                    claimed, cur_state = shared_state.claim_booking(
+                        weekend, day_name, details, ACCOUNT_ID,
+                    )
+                    if not claimed:
+                        # Another account beat us by milliseconds — they already booked.
+                        # We successfully booked a duplicate. Warn the user to cancel.
+                        winner = (cur_state.get(day_name) or {}).get("booked_by", "?")
+                        print(f"    [coord] WARNING: '{winner}' already claimed {day_name}. "
+                              f"This is a duplicate booking — cancel manually.")
+                        send_ntfy(
+                            f"[{ACCOUNT_DISPLAY_NAME}] DUPLICATE booking on {day_name}",
+                            f"Both this account and '{winner}' booked {day_name}. "
+                            f"Cancel one manually. Mine: {details}",
+                            priority="urgent", tags="warning",
+                        )
                 return {
                     "success": True,
-                    "details": f"{slot['time']} at {course_name}",
+                    "details": details,
                     "course": course_name,
                 }
             else:
@@ -1047,20 +1181,40 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
 
 def try_book_day(page, date: str, day_name: str, num_players: int,
                  blacklist: set, exclude_course: str = None,
-                 dry_run: bool = False) -> dict:
-    """Two-pass search: morning window first, then widen to FALLBACK_MAX_HOUR."""
+                 dry_run: bool = False, weekend: str = None) -> dict:
+    """Two-pass search: morning window first, then widen to FALLBACK_MAX_HOUR.
+
+    `weekend` is the combined weekend label used for multi-account coordination
+    (e.g. "4/25/2026 - 4/26/2026"). If another account already booked this day
+    via shared_state, we short-circuit with skipped=True.
+    """
+    # Multi-account coordination: skip if another account already booked this day
+    if weekend:
+        already, booked_by = shared_state.day_already_booked(weekend, day_name)
+        if already:
+            print(f"\n  === {day_name.upper()} already booked by '{booked_by}' — skipping ===")
+            return {"success": False, "details": None, "course": None, "skipped": True}
+
     passes = [("morning", MAX_HOUR), ("fallback", FALLBACK_MAX_HOUR)]
 
     for pass_label, max_hour in passes:
         print(f"\n  === {day_name.upper()} / {pass_label} pass (until {max_hour}:00) ===")
         for round_num in range(1, MAX_SEARCH_ROUNDS_PER_PASS + 1):
             print(f"  Round {round_num}/{MAX_SEARCH_ROUNDS_PER_PASS}")
+            # Poll shared state between rounds too — another account may have won
+            # while we were searching courses on this one.
+            if weekend:
+                already, booked_by = shared_state.day_already_booked(weekend, day_name)
+                if already:
+                    print(f"  [coord] {day_name} was just booked by '{booked_by}' mid-search — stopping")
+                    return {"success": False, "details": None, "course": None, "skipped": True}
             for course_code, course_name in COURSE_CODES.items():
                 if exclude_course and course_name == exclude_course:
                     continue
                 result = search_and_book_course(
                     page, course_code, course_name, date, num_players,
                     max_hour, blacklist, dry_run=dry_run,
+                    weekend=weekend, day_name=day_name,
                 )
                 if result["success"]:
                     return result
@@ -1090,13 +1244,13 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
         print("Login failed — session will retry")
         # Only notify on persistent login failures, not every attempt
         if not is_first_session:
-            send_ntfy("Golf Bot: login failing",
+            send_ntfy(f"[{ACCOUNT_DISPLAY_NAME}] login failing",
                       "Repeated login failures — session will retry. Check the logs.",
                       priority="high", tags="warning")
         return False
 
     if is_first_session:
-        send_ntfy("Golf Bot: logged in",
+        send_ntfy(f"[{ACCOUNT_DISPLAY_NAME}] logged in",
                   "Through login + Queue-it. Now waiting for 8:00 PM release.",
                   priority="low", tags="white_check_mark")
 
@@ -1107,12 +1261,13 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
     if not is_authenticated(page):
         print("Session no longer authenticated after release-wait — re-authenticating")
         if not login_with_retry(page, queue_mode="timeout"):
-            send_ntfy("Golf Bot: re-auth failed after 8 PM",
+            send_ntfy(f"[{ACCOUNT_DISPLAY_NAME}] re-auth failed after 8 PM",
                       "Session expired during wait and re-login failed. Bot will retry.",
                       priority="high", tags="warning")
             return False
 
     blacklist: set = set()
+    weekend = f"{saturday_date} - {sunday_date}"
 
     def course_of(result):
         course = result.get("course")
@@ -1126,21 +1281,24 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
         results[day_key] = try_book_day(
             page, date, day_name, num_players, blacklist,
             exclude_course=exclude_course, dry_run=dry_run,
+            weekend=weekend,
         )
         # Player-count fallback: if no slots for num_players, retry with fewer
         if (not results[day_key]["success"]
+                and not results[day_key].get("skipped")
                 and FALLBACK_NUM_PLAYERS is not None
                 and FALLBACK_NUM_PLAYERS < num_players):
             print(f"\n  === {day_name.upper()} / retrying with {FALLBACK_NUM_PLAYERS} players ===")
             results[day_key] = try_book_day(
                 page, date, day_name, FALLBACK_NUM_PLAYERS, blacklist,
                 exclude_course=exclude_course, dry_run=dry_run,
+                weekend=weekend,
             )
         # Persist state after each day — survives a crash mid-run
         if results[day_key]["success"]:
             save_state(saturday_date, sunday_date, results)
             send_ntfy(
-                f"Golf Bot: {day_name.capitalize()} booked",
+                f"[{ACCOUNT_DISPLAY_NAME}] {day_name.capitalize()} booked",
                 f"{results[day_key]['details']}",
                 priority="default", tags="golf,white_check_mark",
             )
@@ -1171,7 +1329,7 @@ def run_booking(args) -> dict:
     # Launch notification — only when skipping-wait is off (real scheduled runs)
     if not args.now:
         send_ntfy(
-            "Golf Bot: launched",
+            f"[{ACCOUNT_DISPLAY_NAME}] launched",
             f"Running for Sat {saturday_date} / Sun {sunday_date}. "
             "Will book 4 players, falling back to 2 if needed.",
             priority="low", tags="rocket",
@@ -1184,7 +1342,7 @@ def run_booking(args) -> dict:
     session_count = 0
 
     # Watchdog — urgent notification if the bot appears stuck
-    watchdog = Watchdog()
+    watchdog = Watchdog(log_path=BOOKING_LOG_PATH)
     watchdog.start()
 
     with sync_playwright() as p:
@@ -1266,15 +1424,15 @@ def run_booking(args) -> dict:
     any_booked = results["saturday"]["success"] or results["sunday"]["success"]
 
     if both_booked:
-        title = "Golf Bot: Both days booked!"
+        title = f"[{ACCOUNT_DISPLAY_NAME}] Both days booked!"
         tags = "golf,white_check_mark"
         priority = "default"
     elif any_booked:
-        title = "Golf Bot: Partial success"
+        title = f"[{ACCOUNT_DISPLAY_NAME}] Partial success"
         tags = "golf,warning"
         priority = "high"
     else:
-        title = "Golf Bot: No bookings made"
+        title = f"[{ACCOUNT_DISPLAY_NAME}] No bookings made"
         tags = "golf,x"
         priority = "high"
 
@@ -1284,12 +1442,15 @@ def run_booking(args) -> dict:
     if both_booked:
         clear_state()
 
-    # Record the run in history for the dashboard's past-runs view
-    append_to_history(
-        saturday_date, sunday_date, results,
-        run_started=run_started_iso,
-        run_ended=datetime.now().isoformat(timespec="seconds"),
-    )
+    # Record the run in history for the dashboard's past-runs view.
+    # Skip when running under multi_bot — the orchestrator writes one
+    # aggregate entry instead, to avoid per-account noise.
+    if not os.getenv("MULTI_BOT_ACTIVE"):
+        append_to_history(
+            saturday_date, sunday_date, results,
+            run_started=run_started_iso,
+            run_ended=datetime.now().isoformat(timespec="seconds"),
+        )
 
     clear_live_screenshot()
     return results
@@ -1329,15 +1490,21 @@ def parse_args():
                         help="Walk through flow but abort before final checkout")
     parser.add_argument("--headful", action="store_true",
                         help="Show browser window (debugging)")
+    parser.add_argument("--account-id", dest="account_id", default=None,
+                        help="Account id from accounts.json (default: single-account mode, uses .env creds)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
+    # Select credentials + per-account paths before anything else runs.
+    active_account = configure_account_context(args.account_id)
+
     print("=" * 50)
     print("Austin Golf Tee Time Booking Bot")
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Account: {active_account['display_name']} (id={active_account['id']})")
     mode = "IMMEDIATE" if args.now else "SCHEDULED (wait for 8pm)"
     if args.dry_run:
         mode += " [DRY-RUN]"

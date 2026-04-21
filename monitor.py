@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Live monitoring dashboard for the golf booking bot.
+"""Live monitoring dashboard for the Austin municipal tee time bot.
+
+Multi-account aware: reads accounts.json + per-account logs/screenshots
+and renders one row per account plus a shared-state summary card.
 
 Run:  python3 monitor.py
 Then open: http://localhost:8111
@@ -11,17 +14,16 @@ import os
 from datetime import datetime, timedelta
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(SCRIPT_DIR, "booking.log")
-LIVE_SCREENSHOT = os.path.join(SCRIPT_DIR, "debug_screenshots", "live.png")
-LIVE_LABEL = os.path.join(SCRIPT_DIR, "debug_screenshots", "live_label.txt")
+DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_screenshots")
 HISTORY_FILE = os.path.join(SCRIPT_DIR, "history.json")
+ACCOUNTS_FILE = os.path.join(SCRIPT_DIR, "accounts.json")
+SHARED_STATE_FILE = os.path.join(SCRIPT_DIR, "shared_state.json")
 PORT = 8111
 
 
 def seconds_until_next_monday_745pm() -> int:
-    """Return seconds until the next Monday 7:45 PM local time."""
     now = datetime.now()
-    target_weekday = 0  # Monday
+    target_weekday = 0
     target_hour, target_minute = 19, 45
     days_ahead = (target_weekday - now.weekday()) % 7
     candidate = (now + timedelta(days=days_ahead)).replace(
@@ -30,6 +32,44 @@ def seconds_until_next_monday_745pm() -> int:
     if candidate <= now:
         candidate += timedelta(days=7)
     return int((candidate - now).total_seconds())
+
+
+def load_accounts():
+    try:
+        with open(ACCOUNTS_FILE, "r") as f:
+            raw = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    accounts = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("disabled"):
+            continue
+        if entry.get("username") == "REPLACE_ME" or entry.get("password") == "REPLACE_ME":
+            continue
+        accounts.append({
+            "id": entry["id"],
+            "display_name": entry.get("display_name", entry["id"]),
+        })
+    return accounts
+
+
+def per_account_paths(account_id: str):
+    return {
+        "log": os.path.join(SCRIPT_DIR, f"booking_{account_id}.log"),
+        "screenshot": os.path.join(DEBUG_DIR, f"live_{account_id}.png"),
+        "label": os.path.join(DEBUG_DIR, f"live_label_{account_id}.txt"),
+    }
+
+
+def read_log_tail(path: str, n_lines: int = 30) -> list:
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return []
+    return [l.rstrip("\n") for l in lines[-n_lines:]]
 
 
 HTML = """<!DOCTYPE html>
@@ -44,7 +84,6 @@ HTML = """<!DOCTYPE html>
     --surface: #18181b;
     --surface-2: #27272a;
     --border: #27272a;
-    --border-strong: #3f3f46;
     --text: #fafafa;
     --text-muted: #a1a1aa;
     --text-subtle: #71717a;
@@ -54,195 +93,139 @@ HTML = """<!DOCTYPE html>
     --danger-bg: rgba(239, 68, 68, 0.1);
     --warning: #eab308;
     --warning-bg: rgba(234, 179, 8, 0.1);
-    --accent: #3b82f6;
   }
-
   * { margin: 0; padding: 0; box-sizing: border-box; }
-
   body {
-    background: var(--bg);
-    color: var(--text);
+    background: var(--bg); color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
                  "Helvetica Neue", Arial, sans-serif;
-    font-size: 14px;
-    line-height: 1.5;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
+    font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased;
     min-height: 100vh;
   }
+  .container { max-width: 1600px; margin: 0 auto; padding: 32px 24px; }
 
-  .container {
-    max-width: 1400px;
-    margin: 0 auto;
-    padding: 32px 24px;
-  }
-
-  /* Header */
   .header {
     display: flex; align-items: center; gap: 16px;
-    margin-bottom: 32px; padding-bottom: 20px;
+    margin-bottom: 28px; padding-bottom: 20px;
     border-bottom: 1px solid var(--border);
   }
-  .header h1 {
-    font-size: 20px; font-weight: 600; letter-spacing: -0.02em;
-  }
+  .header h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }
   .status-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--text-subtle);
-    flex-shrink: 0;
+    width: 8px; height: 8px; border-radius: 50%; background: var(--text-subtle); flex-shrink: 0;
   }
-  .status-dot.active {
-    background: var(--success); animation: pulse 2s infinite;
-  }
+  .status-dot.active { background: var(--success); animation: pulse 2s infinite; }
   .status-dot.success { background: var(--success); }
   .status-dot.failed { background: var(--danger); }
   @keyframes pulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
     50% { box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
   }
-  .status-text {
-    font-size: 13px; color: var(--text-muted);
-  }
+  .status-text { font-size: 13px; color: var(--text-muted); }
   .next-run {
     margin-left: auto; font-size: 13px; color: var(--text-muted);
     display: flex; align-items: center; gap: 8px;
   }
   .next-run-value { color: var(--text); font-weight: 500; }
 
-  /* Stat grid */
-  .stats {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 1px;
-    background: var(--border);
-    border: 1px solid var(--border);
-    border-radius: 8px;
+  /* Shared-state summary card */
+  .shared-state {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; margin-bottom: 24px;
+    display: grid; grid-template-columns: repeat(2, 1fr);
     overflow: hidden;
-    margin-bottom: 24px;
   }
-  .stat {
-    background: var(--bg);
-    padding: 16px 20px;
+  .shared-day {
+    padding: 16px 20px; border-right: 1px solid var(--border);
     display: flex; flex-direction: column; gap: 4px;
   }
-  .stat-label {
-    font-size: 11px; font-weight: 500; color: var(--text-subtle);
-    text-transform: uppercase; letter-spacing: 0.05em;
+  .shared-day:last-child { border-right: none; }
+  .shared-label {
+    font-size: 11px; color: var(--text-subtle);
+    text-transform: uppercase; letter-spacing: 0.05em; font-weight: 500;
   }
-  .stat-value {
-    font-size: 15px; font-weight: 500; color: var(--text);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .stat-value.success { color: var(--success); }
-  .stat-value.danger { color: var(--danger); }
-  .stat-value.warning { color: var(--warning); }
-  .stat-value.muted { color: var(--text-muted); font-weight: 400; }
+  .shared-value { font-size: 16px; color: var(--text); font-weight: 500; }
+  .shared-value.booked { color: var(--success); }
+  .shared-value.pending { color: var(--text-muted); font-weight: 400; }
+  .shared-detail { font-size: 12px; color: var(--text-subtle); margin-top: 2px; }
 
-  /* Main grid */
-  .main-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-    margin-bottom: 24px;
-  }
-  @media (max-width: 900px) { .main-grid { grid-template-columns: 1fr; } }
-
-  .card {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
+  /* Account rows */
+  .accounts { display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
+  .account-card {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
     overflow: hidden;
-    display: flex; flex-direction: column;
   }
-  .card-header {
-    padding: 12px 16px;
+  .account-header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 16px;
     border-bottom: 1px solid var(--border);
+  }
+  .account-name { font-weight: 500; color: var(--text); }
+  .account-meta { color: var(--text-subtle); font-size: 12px; margin-left: auto; }
+  .account-body {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
+    background: var(--border);
+  }
+  @media (max-width: 1000px) { .account-body { grid-template-columns: 1fr; } }
+  .account-col { background: var(--bg); padding: 12px 16px; min-width: 0; }
+  .account-col-title {
+    font-size: 11px; color: var(--text-subtle); text-transform: uppercase;
+    letter-spacing: 0.05em; margin-bottom: 8px;
+  }
+  .account-screenshot img {
+    width: 100%; display: block; border-radius: 4px; border: 1px solid var(--border);
+  }
+  .account-screenshot-empty {
+    aspect-ratio: 16 / 10; display: flex; align-items: center; justify-content: center;
+    color: var(--text-subtle); font-size: 12px; border: 1px dashed var(--border); border-radius: 4px;
+  }
+  .account-log {
+    font-family: ui-monospace, "SF Mono", "Menlo", "Monaco", monospace;
+    font-size: 11px; line-height: 1.55; color: var(--text-muted);
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 240px; overflow-y: auto;
+  }
+  .account-log::-webkit-scrollbar { width: 6px; }
+  .account-log::-webkit-scrollbar-thumb { background: var(--surface-2); border-radius: 3px; }
+  .account-log .log-success { color: var(--success); }
+  .account-log .log-error { color: var(--danger); }
+  .account-log .log-warn { color: var(--warning); }
+  .account-log .log-header { color: var(--text); font-weight: 500; }
+
+  /* History */
+  .history-panel {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+  }
+  .history-header {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
     display: flex; justify-content: space-between; align-items: center;
     font-size: 13px;
   }
-  .card-title { font-weight: 500; color: var(--text); }
-  .card-meta { color: var(--text-subtle); font-size: 12px; }
-
-  /* Browser view */
-  .browser-body { padding: 12px; }
-  .browser-body img {
-    width: 100%; display: block; border-radius: 4px;
-    border: 1px solid var(--border);
-  }
-  .browser-empty {
-    aspect-ratio: 16 / 10;
-    display: flex; align-items: center; justify-content: center;
-    color: var(--text-subtle); text-align: center; font-size: 13px;
-    border: 1px dashed var(--border);
-    border-radius: 4px;
-  }
-
-  /* Log */
-  .log-body {
-    padding: 12px 16px;
-    overflow-y: auto;
-    max-height: 520px;
-    font-family: ui-monospace, "SF Mono", "Menlo", "Monaco", monospace;
-    font-size: 12px;
-    line-height: 1.6;
-    white-space: pre-wrap; word-break: break-word;
-  }
-  .log-body::-webkit-scrollbar { width: 8px; }
-  .log-body::-webkit-scrollbar-track { background: var(--bg); }
-  .log-body::-webkit-scrollbar-thumb { background: var(--surface-2); border-radius: 4px; }
-  .line { padding: 0 4px; color: var(--text-muted); }
-  .line.log-success { color: var(--success); }
-  .line.log-error { color: var(--danger); }
-  .line.log-warn { color: var(--warning); }
-  .line.log-header { color: var(--text); font-weight: 500; }
-  .line.log-dim { color: var(--text-subtle); }
-  .empty-state {
-    padding: 48px 24px; color: var(--text-subtle);
-    text-align: center; font-size: 13px;
-  }
-
-  /* History */
-  .history-table {
-    width: 100%; border-collapse: collapse; font-size: 13px;
-  }
+  .history-title { font-weight: 500; }
+  .history-meta { color: var(--text-subtle); font-size: 12px; }
+  .history-table { width: 100%; border-collapse: collapse; font-size: 13px; }
   .history-table th {
-    text-align: left;
-    padding: 10px 16px;
-    color: var(--text-subtle);
-    font-size: 11px; font-weight: 500;
+    text-align: left; padding: 10px 16px;
+    color: var(--text-subtle); font-size: 11px; font-weight: 500;
     text-transform: uppercase; letter-spacing: 0.05em;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg);
+    border-bottom: 1px solid var(--border); background: var(--bg);
   }
   .history-table td {
-    padding: 14px 16px;
-    border-bottom: 1px solid var(--border);
-    color: var(--text);
+    padding: 14px 16px; border-bottom: 1px solid var(--border); color: var(--text);
   }
   .history-table tr:last-child td { border-bottom: none; }
   .history-table tr:hover td { background: rgba(255, 255, 255, 0.02); }
   .history-table td.muted { color: var(--text-muted); }
+  .empty-state { padding: 40px; color: var(--text-subtle); text-align: center; font-size: 13px; }
 
-  /* Badges */
   .badge {
     display: inline-flex; align-items: center; gap: 6px;
-    padding: 4px 10px;
-    border-radius: 4px;
-    font-size: 12px; font-weight: 500;
-    white-space: nowrap;
+    padding: 4px 10px; border-radius: 4px;
+    font-size: 12px; font-weight: 500; white-space: nowrap;
   }
   .badge.success { background: var(--success-bg); color: var(--success); }
-  .badge.danger { background: var(--danger-bg); color: var(--danger); }
+  .badge.danger  { background: var(--danger-bg); color: var(--danger); }
   .badge.warning { background: var(--warning-bg); color: var(--warning); }
-  .badge.neutral { background: var(--surface); color: var(--text-muted); }
-  .badge-dot {
-    width: 6px; height: 6px; border-radius: 50%;
-    background: currentColor;
-  }
-
-  .overall-badge {
-    padding: 3px 8px; font-size: 11px;
-  }
+  .badge-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 </style>
 </head>
 <body>
@@ -259,64 +242,30 @@ HTML = """<!DOCTYPE html>
     </div>
   </header>
 
-  <div class="stats">
-    <div class="stat">
-      <div class="stat-label">Phase</div>
-      <div class="stat-value muted" id="phase">Idle</div>
+  <!-- Shared state summary -->
+  <div class="shared-state">
+    <div class="shared-day">
+      <span class="shared-label">Saturday</span>
+      <span class="shared-value pending" id="sharedSat">—</span>
+      <span class="shared-detail" id="sharedSatBy"></span>
     </div>
-    <div class="stat">
-      <div class="stat-label">Saturday</div>
-      <div class="stat-value muted" id="satResult">—</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Sunday</div>
-      <div class="stat-value muted" id="sunResult">—</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Players</div>
-      <div class="stat-value muted" id="players">—</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Release countdown</div>
-      <div class="stat-value muted" id="countdown">—</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Last update</div>
-      <div class="stat-value muted" id="lastUpdate">—</div>
+    <div class="shared-day">
+      <span class="shared-label">Sunday</span>
+      <span class="shared-value pending" id="sharedSun">—</span>
+      <span class="shared-detail" id="sharedSunBy"></span>
     </div>
   </div>
 
-  <div class="main-grid">
-
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">Browser view</span>
-        <span class="card-meta" id="browserLabel">no screenshot</span>
-      </div>
-      <div class="browser-body">
-        <img id="browserImg" src="/api/screenshot" style="display:none" alt="live screenshot">
-        <div class="browser-empty" id="browserEmpty">
-          Bot isn't running. Live screenshot will appear here during a run.
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">Run log</span>
-        <span class="card-meta" id="lineCount">0 lines</span>
-      </div>
-      <div class="log-body" id="logContent">
-        <div class="empty-state">Log is empty. Waiting for the next run.</div>
-      </div>
-    </div>
-
+  <!-- Per-account rows -->
+  <div class="accounts" id="accounts">
+    <div class="empty-state" id="accountsEmpty">No enabled accounts found in accounts.json.</div>
   </div>
 
-  <div class="card">
-    <div class="card-header">
-      <span class="card-title">Run history</span>
-      <span class="card-meta" id="historyCount">0 runs</span>
+  <!-- Run history -->
+  <div class="history-panel">
+    <div class="history-header">
+      <span class="history-title">Run history</span>
+      <span class="history-meta" id="historyCount">0 runs</span>
     </div>
     <div id="historyBody">
       <div class="empty-state">No past runs recorded yet.</div>
@@ -326,7 +275,7 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-let prevLength = 0;
+let accounts = [];
 let nextRunSeconds = 0;
 
 function formatDuration(s) {
@@ -336,38 +285,34 @@ function formatDuration(s) {
   return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h';
 }
 
+function formatTimestamp(iso) {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString([], {month: 'short', day: 'numeric'})
+           + ', ' + d.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+  } catch (e) { return iso; }
+}
+
 function classifyLine(text) {
   const t = text.toLowerCase();
-  if (t.includes('booked!') || t.includes('verified') || t.includes('dry-run ok') || t.includes('success —')) return 'log-success';
+  if (t.includes('booked!') || t.includes('verified') || t.includes('dry-run ok') || t.includes('success')) return 'log-success';
   if (t.includes('failed') || t.includes('error') || t.includes('timeout') || t.includes('crash')) return 'log-error';
-  if (t.includes('warn') || t.includes('retry') || t.includes('taken') || t.includes('session expired')) return 'log-warn';
+  if (t.includes('warn') || t.includes('taken') || t.includes('session expired') || t.includes('retry')) return 'log-warn';
   if (t.includes('===') || t.includes('***') || t.startsWith('session')) return 'log-header';
-  if (t.includes('until release') || t.includes('sleeping') || t.includes('waiting')) return 'log-dim';
   return '';
 }
 
-function parseResults(lines) {
-  let sat = '—', sun = '—';
-  let satClass = 'muted', sunClass = 'muted';
-  let isRunning = false;
-  let phase = 'Idle';
-  let phaseClass = 'muted';
-  let countdown = '—';
-  let players = '—';
+function escapeHtml(t) {
+  return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g, '&quot;');
+}
 
+function phaseFromLog(lines) {
+  // Walk from end — most recent signal wins
+  let phase = 'Idle';
+  let phaseClass = '';
   for (const line of lines) {
     const t = line.toLowerCase();
-
-    const sessionMatch = line.match(/SESSION (\\d+)/);
-    if (sessionMatch) { isRunning = true; }
-
-    const playerMatch = line.match(/Players:\\s*(\\d+)/);
-    if (playerMatch) { players = playerMatch[1]; }
-    if (t.includes('retrying with') && t.includes('players')) {
-      const fbMatch = line.match(/retrying with (\\d+) players/i);
-      if (fbMatch) players = fbMatch[1] + ' (fallback)';
-    }
-
     if (t.includes('austin golf tee time')) { phase = 'Starting'; phaseClass = ''; }
     if (t.includes('logging in')) { phase = 'Logging in'; phaseClass = 'warning'; }
     if (t.includes('[login] success')) { phase = 'Logged in'; phaseClass = 'success'; }
@@ -376,115 +321,168 @@ function parseResults(lines) {
     if (t.includes('[queue]') && t.includes('released')) { phase = 'Through queue'; phaseClass = 'success'; }
     if (t.includes('waiting until') && t.includes('release')) { phase = 'Waiting for release'; phaseClass = 'warning'; }
     if (t.includes('release time reached')) { phase = 'Searching'; phaseClass = ''; }
-    if (t.includes('already past release')) { phase = 'Searching'; phaseClass = ''; }
     if (t.includes('booking saturday')) { phase = 'Searching Saturday'; phaseClass = ''; }
     if (t.includes('booking sunday')) { phase = 'Searching Sunday'; phaseClass = ''; }
-    if (t.includes('morning pass')) { phase = phase.split(' —')[0] + ' (morning)'; }
-    if (t.includes('fallback pass')) { phase = phase.split(' —')[0] + ' (afternoon)'; }
-    if (t.includes('[recovery]')) { phase = 'Recovering'; phaseClass = 'danger'; }
+    if (t.includes('already booked by')) { phase = 'Stopped (another account won)'; phaseClass = 'success'; }
     if (t.includes('verified')) { phase = 'Booking verified'; phaseClass = 'success'; }
     if (t.includes('final results')) { phase = 'Done'; phaseClass = 'success'; }
     if (t.includes('max time') && t.includes('exceeded')) { phase = 'Timed out'; phaseClass = 'danger'; }
-
-    const countdownMatch = line.match(/(\\d+)s until release/);
-    if (countdownMatch) {
-      const secs = parseInt(countdownMatch[1]);
-      countdown = Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0');
-    }
-    if (t.includes('release time reached') || t.includes('already past release')) { countdown = 'Live'; }
-
-    if (t.includes('saturday') && t.includes('success')) {
-      const detail = line.match(/SUCCESS.*?[—-]\\s*(.+)/);
-      sat = detail ? detail[1].trim() : 'Booked'; satClass = 'success';
-    }
-    if (t.includes('sunday') && t.includes('success')) {
-      const detail = line.match(/SUCCESS.*?[—-]\\s*(.+)/);
-      sun = detail ? detail[1].trim() : 'Booked'; sunClass = 'success';
-    }
-    if (t.includes('saturday') && t.includes('no booking')) { sat = 'No booking'; satClass = 'danger'; }
-    if (t.includes('sunday') && t.includes('no booking')) { sun = 'No booking'; sunClass = 'danger'; }
-
-    if (t.includes('booking saturday') && sat === '—') { sat = 'Searching…'; satClass = 'warning'; }
-    if (t.includes('booking sunday') && sun === '—') { sun = 'Searching…'; sunClass = 'warning'; }
   }
-
-  return { sat, sun, satClass, sunClass, isRunning, phase, phaseClass, countdown, players };
+  return { phase, phaseClass };
 }
 
-async function refreshLog() {
+function buildAccountCard(account) {
+  return `
+    <div class="account-card" data-account-id="${escapeHtml(account.id)}">
+      <div class="account-header">
+        <span class="status-dot" data-role="dot"></span>
+        <span class="account-name">${escapeHtml(account.display_name)}</span>
+        <span class="badge neutral" data-role="phase" style="background: var(--surface); color: var(--text-muted)">Idle</span>
+        <span class="account-meta" data-role="lastupdate">—</span>
+      </div>
+      <div class="account-body">
+        <div class="account-col">
+          <div class="account-col-title">Browser view</div>
+          <div class="account-screenshot">
+            <img data-role="img" style="display:none">
+            <div data-role="img-empty" class="account-screenshot-empty">waiting…</div>
+          </div>
+        </div>
+        <div class="account-col">
+          <div class="account-col-title">Recent log</div>
+          <div class="account-log" data-role="log">—</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function refreshAccounts() {
   try {
-    const resp = await fetch('/api/log');
-    const data = await resp.json();
-    const lines = data.lines;
-
-    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
-
-    if (lines.length === 0) return;
-
-    if (lines.length !== prevLength) {
-      prevLength = lines.length;
-
-      const container = document.getElementById('logContent');
-      container.innerHTML = lines.map(l =>
-        `<div class="line ${classifyLine(l)}">${escapeHtml(l)}</div>`
-      ).join('');
-      container.scrollTop = container.scrollHeight;
-
-      document.getElementById('lineCount').textContent = lines.length + ' lines';
-
-      const r = parseResults(lines);
-      setStat('satResult', r.sat, r.satClass);
-      setStat('sunResult', r.sun, r.sunClass);
-      setStat('phase', r.phase, r.phaseClass);
-      setStat('players', r.players, r.players === '—' ? 'muted' : '');
-      setStat('countdown', r.countdown, r.countdown === '—' ? 'muted' : '');
-
-      const dot = document.getElementById('statusDot');
-      const statusText = document.getElementById('statusText');
-      if (r.phase === 'Done') {
-        const allBooked = r.satClass === 'success' && r.sunClass === 'success';
-        dot.className = 'status-dot ' + (allBooked ? 'success' : 'failed');
-        statusText.textContent = allBooked ? 'Both days booked' : 'Finished';
-      } else if (r.phase === 'Timed out') {
-        dot.className = 'status-dot failed';
-        statusText.textContent = 'Timed out';
-      } else if (r.phase === 'Waiting in queue') {
-        dot.className = 'status-dot active';
-        statusText.textContent = 'In waiting room';
-      } else if (r.phase.includes('Waiting')) {
-        dot.className = 'status-dot active';
-        statusText.textContent = 'Waiting';
-      } else if (r.isRunning) {
-        dot.className = 'status-dot active';
-        statusText.textContent = 'Running';
-      }
+    const resp = await fetch('/api/accounts');
+    accounts = await resp.json();
+    const container = document.getElementById('accounts');
+    const empty = document.getElementById('accountsEmpty');
+    if (!accounts.length) {
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    if (container.querySelectorAll('.account-card').length !== accounts.length) {
+      container.innerHTML = accounts.map(buildAccountCard).join('');
     }
   } catch (e) {}
 }
 
-function setStat(id, text, cls) {
-  const el = document.getElementById(id);
-  el.textContent = text;
-  el.className = 'stat-value ' + (cls || '');
+async function refreshAccountData() {
+  for (const acc of accounts) {
+    try {
+      const card = document.querySelector(`[data-account-id="${acc.id}"]`);
+      if (!card) continue;
+      const [logResp, shotResp] = await Promise.all([
+        fetch('/api/log/' + acc.id),
+        fetch('/api/screenshot_info/' + acc.id),
+      ]);
+      const logData = await logResp.json();
+      const shotData = await shotResp.json();
+
+      // Log
+      const logEl = card.querySelector('[data-role="log"]');
+      const lines = logData.lines || [];
+      if (lines.length) {
+        logEl.innerHTML = lines.map(l =>
+          `<div class="${classifyLine(l)}">${escapeHtml(l)}</div>`
+        ).join('');
+        logEl.scrollTop = logEl.scrollHeight;
+      } else {
+        logEl.textContent = 'No log yet';
+      }
+
+      // Phase + status dot
+      const {phase, phaseClass} = phaseFromLog(lines);
+      const phaseEl = card.querySelector('[data-role="phase"]');
+      phaseEl.textContent = phase;
+      phaseEl.className = 'badge ' + (phaseClass || 'neutral');
+      if (!phaseClass) {
+        phaseEl.style.background = 'var(--surface)';
+        phaseEl.style.color = 'var(--text-muted)';
+      } else {
+        phaseEl.style.background = '';
+        phaseEl.style.color = '';
+      }
+
+      const dotEl = card.querySelector('[data-role="dot"]');
+      if (phase === 'Done' || phase === 'Booking verified' || phase === 'Stopped (another account won)') {
+        dotEl.className = 'status-dot success';
+      } else if (phase === 'Login failed' || phase === 'Timed out') {
+        dotEl.className = 'status-dot failed';
+      } else if (phase !== 'Idle') {
+        dotEl.className = 'status-dot active';
+      } else {
+        dotEl.className = 'status-dot';
+      }
+
+      // Last update
+      const lastUpdate = card.querySelector('[data-role="lastupdate"]');
+      lastUpdate.textContent = lines.length ? `${lines.length} lines` : '';
+
+      // Screenshot
+      const img = card.querySelector('[data-role="img"]');
+      const imgEmpty = card.querySelector('[data-role="img-empty"]');
+      if (shotData.exists) {
+        img.src = '/api/screenshot/' + acc.id + '?t=' + shotData.mtime;
+        img.style.display = 'block';
+        imgEmpty.style.display = 'none';
+      } else {
+        img.style.display = 'none';
+        imgEmpty.style.display = 'flex';
+      }
+    } catch (e) {}
+  }
 }
 
-async function refreshScreenshot() {
+async function refreshSharedState() {
   try {
-    const resp = await fetch('/api/screenshot_info');
-    const info = await resp.json();
-    const img = document.getElementById('browserImg');
-    const empty = document.getElementById('browserEmpty');
-    const label = document.getElementById('browserLabel');
+    const resp = await fetch('/api/shared_state');
+    const state = await resp.json();
+    const sat = state.saturday || {};
+    const sun = state.sunday || {};
 
-    if (info.exists) {
-      img.src = '/api/screenshot?t=' + info.mtime;
-      img.style.display = 'block';
-      empty.style.display = 'none';
-      label.textContent = info.label || new Date(info.mtime * 1000).toLocaleTimeString();
+    const satEl = document.getElementById('sharedSat');
+    const satByEl = document.getElementById('sharedSatBy');
+    const sunEl = document.getElementById('sharedSun');
+    const sunByEl = document.getElementById('sharedSunBy');
+
+    if (sat.booked_by) {
+      satEl.textContent = sat.details || 'Booked';
+      satEl.className = 'shared-value booked';
+      satByEl.textContent = 'booked by ' + sat.booked_by;
     } else {
-      img.style.display = 'none';
-      empty.style.display = 'flex';
-      label.textContent = 'no screenshot';
+      satEl.textContent = 'Not booked';
+      satEl.className = 'shared-value pending';
+      satByEl.textContent = '';
+    }
+    if (sun.booked_by) {
+      sunEl.textContent = sun.details || 'Booked';
+      sunEl.className = 'shared-value booked';
+      sunByEl.textContent = 'booked by ' + sun.booked_by;
+    } else {
+      sunEl.textContent = 'Not booked';
+      sunEl.className = 'shared-value pending';
+      sunByEl.textContent = '';
+    }
+
+    const dot = document.getElementById('statusDot');
+    const text = document.getElementById('statusText');
+    if (sat.booked_by && sun.booked_by) {
+      dot.className = 'status-dot success';
+      text.textContent = 'Both days booked';
+    } else if (sat.booked_by || sun.booked_by) {
+      dot.className = 'status-dot active';
+      text.textContent = 'Partial — still searching';
+    } else {
+      dot.className = 'status-dot';
+      text.textContent = 'Idle';
     }
   } catch (e) {}
 }
@@ -497,49 +495,26 @@ async function refreshNextRun() {
     tickNextRun();
   } catch (e) {}
 }
-
 function tickNextRun() {
   if (nextRunSeconds > 0) nextRunSeconds -= 1;
-  const el = document.getElementById('nextRun');
-  el.textContent = nextRunSeconds <= 0 ? 'now' : formatDuration(nextRunSeconds);
-}
-
-function formatTimestamp(iso) {
-  if (!iso) return '—';
-  try {
-    const d = new Date(iso);
-    const dateStr = d.toLocaleDateString([], {month: 'short', day: 'numeric'});
-    const timeStr = d.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
-    return dateStr + ', ' + timeStr;
-  } catch (e) { return iso; }
-}
-
-function runDuration(started, ended) {
-  if (!started || !ended) return '—';
-  try {
-    const sec = Math.max(0, Math.round((new Date(ended) - new Date(started)) / 1000));
-    return formatDuration(sec);
-  } catch (e) { return '—'; }
+  document.getElementById('nextRun').textContent = nextRunSeconds <= 0 ? 'now' : formatDuration(nextRunSeconds);
 }
 
 function renderHistory(entries) {
   const body = document.getElementById('historyBody');
   const count = document.getElementById('historyCount');
   count.textContent = entries.length + (entries.length === 1 ? ' run' : ' runs');
-
   if (!entries.length) {
     body.innerHTML = '<div class="empty-state">No past runs recorded yet.</div>';
     return;
   }
-
   let html = '<table class="history-table"><thead><tr>';
   html += '<th style="width:140px">Run date</th>';
   html += '<th style="width:110px">Status</th>';
   html += '<th>Saturday</th>';
   html += '<th>Sunday</th>';
-  html += '<th style="width:100px">Duration</th>';
+  html += '<th style="width:140px">Booked by</th>';
   html += '</tr></thead><tbody>';
-
   for (const e of entries) {
     const sat = e.results?.saturday;
     const sun = e.results?.sunday;
@@ -547,28 +522,24 @@ function renderHistory(entries) {
     const sunOk = !!sun?.success;
     const satText = satOk ? sat.details : 'No booking';
     const sunText = sunOk ? sun.details : 'No booking';
-
-    let overall, overallClass;
-    if (satOk && sunOk) { overall = 'Success'; overallClass = 'success'; }
-    else if (satOk || sunOk) { overall = 'Partial'; overallClass = 'warning'; }
-    else { overall = 'Failed'; overallClass = 'danger'; }
-
+    let overall, cls;
+    if (satOk && sunOk) { overall = 'Success'; cls = 'success'; }
+    else if (satOk || sunOk) { overall = 'Partial'; cls = 'warning'; }
+    else { overall = 'Failed'; cls = 'danger'; }
+    const winners = [];
+    if (sat?.booked_by) winners.push('Sat: ' + sat.booked_by);
+    if (sun?.booked_by) winners.push('Sun: ' + sun.booked_by);
+    const bookedBy = winners.length ? winners.join(', ') : (e.account_name || '—');
     html += '<tr>';
     html += '<td class="muted">' + escapeHtml(formatTimestamp(e.run_started)) + '</td>';
-    html += '<td><span class="badge ' + overallClass + '"><span class="badge-dot"></span>' + overall + '</span></td>';
-    html += '<td>' + renderBookingCell(satText, satOk) + '</td>';
-    html += '<td>' + renderBookingCell(sunText, sunOk) + '</td>';
-    html += '<td class="muted">' + escapeHtml(runDuration(e.run_started, e.run_ended)) + '</td>';
+    html += '<td><span class="badge ' + cls + '"><span class="badge-dot"></span>' + overall + '</span></td>';
+    html += '<td>' + (satOk ? '<span style="color:var(--success)">✓</span> ' : '<span style="color:var(--danger)">✗</span> ') + escapeHtml(satText) + '</td>';
+    html += '<td>' + (sunOk ? '<span style="color:var(--success)">✓</span> ' : '<span style="color:var(--danger)">✗</span> ') + escapeHtml(sunText) + '</td>';
+    html += '<td class="muted">' + escapeHtml(bookedBy) + '</td>';
     html += '</tr>';
   }
   html += '</tbody></table>';
   body.innerHTML = html;
-}
-
-function renderBookingCell(text, ok) {
-  const cls = ok ? 'success' : 'danger';
-  const icon = ok ? '✓' : '✗';
-  return '<span style="color: var(--' + cls + ')">' + icon + '</span> ' + escapeHtml(text);
 }
 
 async function refreshHistory() {
@@ -576,37 +547,23 @@ async function refreshHistory() {
     const resp = await fetch('/api/history');
     const entries = await resp.json();
     renderHistory(entries);
-    if (entries[0] && prevLength === 0) applyHistoryToStatus(entries[0]);
   } catch (e) {}
 }
 
-function applyHistoryToStatus(entry) {
-  const sat = entry.results?.saturday;
-  const sun = entry.results?.sunday;
-  setStat('satResult', sat?.success ? sat.details : 'No booking', sat?.success ? 'success' : 'danger');
-  setStat('sunResult', sun?.success ? sun.details : 'No booking', sun?.success ? 'success' : 'danger');
-  setStat('phase', 'Idle — last ran ' + formatTimestamp(entry.run_started), '');
-
-  const dot = document.getElementById('statusDot');
-  const statusText = document.getElementById('statusText');
-  const allBooked = sat?.success && sun?.success;
-  dot.className = 'status-dot ' + (allBooked ? 'success' : 'failed');
-  statusText.textContent = allBooked ? 'Last run: both booked' : 'Last run: incomplete';
-}
-
-function escapeHtml(t) {
-  return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g, '&quot;');
-}
-
-setInterval(refreshLog, 1000);
-setInterval(refreshScreenshot, 2000);
+setInterval(refreshAccounts, 30000);
+setInterval(refreshAccountData, 2000);
+setInterval(refreshSharedState, 2000);
+setInterval(refreshHistory, 10000);
 setInterval(tickNextRun, 1000);
 setInterval(refreshNextRun, 60000);
-setInterval(refreshHistory, 10000);
-refreshLog();
-refreshScreenshot();
-refreshNextRun();
-refreshHistory();
+
+(async () => {
+  await refreshAccounts();
+  refreshAccountData();
+  refreshSharedState();
+  refreshHistory();
+  refreshNextRun();
+})();
 </script>
 </body>
 </html>"""
@@ -616,34 +573,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
 
-        if path == "/api/log":
-            lines = []
-            try:
-                with open(LOG_FILE, "r") as f:
-                    lines = [l.rstrip("\n") for l in f.readlines()]
-            except FileNotFoundError:
-                pass
+        if path == "/api/accounts":
+            self._json(load_accounts())
+
+        elif path.startswith("/api/log/"):
+            account_id = path.split("/", 3)[3]
+            lines = read_log_tail(per_account_paths(account_id)["log"], n_lines=30)
             self._json({"lines": lines})
 
-        elif path == "/api/screenshot_info":
+        elif path.startswith("/api/screenshot_info/"):
+            account_id = path.split("/", 3)[3]
+            p = per_account_paths(account_id)
             info = {"exists": False, "mtime": 0, "label": ""}
-            if os.path.exists(LIVE_SCREENSHOT):
+            if os.path.exists(p["screenshot"]):
                 info["exists"] = True
-                info["mtime"] = int(os.path.getmtime(LIVE_SCREENSHOT))
+                info["mtime"] = int(os.path.getmtime(p["screenshot"]))
                 try:
-                    with open(LIVE_LABEL, "r") as f:
+                    with open(p["label"], "r") as f:
                         info["label"] = f.read().strip()
                 except Exception:
                     pass
             self._json(info)
 
-        elif path == "/api/screenshot":
-            if not os.path.exists(LIVE_SCREENSHOT):
-                self.send_response(404)
-                self.end_headers()
-                return
+        elif path.startswith("/api/screenshot/"):
+            account_id = path.split("/", 3)[3]
+            screenshot_path = per_account_paths(account_id)["screenshot"]
+            if not os.path.exists(screenshot_path):
+                self.send_response(404); self.end_headers(); return
             try:
-                with open(LIVE_SCREENSHOT, "rb") as f:
+                with open(screenshot_path, "rb") as f:
                     data = f.read()
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
@@ -651,8 +609,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
             except Exception:
-                self.send_response(500)
-                self.end_headers()
+                self.send_response(500); self.end_headers()
+
+        elif path == "/api/shared_state":
+            try:
+                with open(SHARED_STATE_FILE, "r") as f:
+                    raw = f.read().strip()
+                    data = json.loads(raw) if raw else {}
+            except (FileNotFoundError, json.JSONDecodeError):
+                data = {}
+            self._json(data)
 
         elif path == "/api/next_run":
             self._json({"seconds": seconds_until_next_monday_745pm()})
@@ -672,8 +638,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(HTML.encode())
 
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.send_response(404); self.end_headers()
 
     def _json(self, obj):
         self.send_response(200)
@@ -687,8 +652,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Golf Bot Monitor running at http://localhost:{PORT}")
-    print("Open this URL in your browser to watch the bot.")
+    print(f"Austin Tee Time Bot Monitor running at http://localhost:{PORT}")
     print("Press Ctrl+C to stop.\n")
     server = http.server.HTTPServer(("", PORT), Handler)
     try:

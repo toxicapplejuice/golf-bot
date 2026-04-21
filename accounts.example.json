@@ -1,0 +1,15 @@
+[
+  {
+    "id": "michael",
+    "display_name": "Michael",
+    "username": "YOUR_WEBTRAC_USERNAME",
+    "password": "YOUR_WEBTRAC_PASSWORD"
+  },
+  {
+    "id": "friend1",
+    "display_name": "Friend 1",
+    "username": "FRIEND_WEBTRAC_USERNAME",
+    "password": "FRIEND_WEBTRAC_PASSWORD",
+    "disabled": false
+  }
+]

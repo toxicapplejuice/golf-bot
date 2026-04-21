@@ -5,8 +5,9 @@ Runs 15 minutes before the actual bot (at 7:30 PM Monday) to verify:
 - Required env vars are present
 - Python deps import cleanly
 - Playwright can launch Firefox
-- WebTrac site is reachable and login flow works
-- Notification channels actually deliver
+- accounts.json loads with at least one enabled account
+- WebTrac site is reachable + login works for EACH enabled account
+- Notification channels deliver
 
 If anything's broken, sends a high-priority notification so there's time
 to fix it before 8:00 PM. Exits 0 on success, 1 on failure.
@@ -28,10 +29,10 @@ def main() -> int:
     failures: list[str] = []
     warnings: list[str] = []
 
-    print("=" * 50)
-    print("Golf Bot Pre-Flight Check")
+    print("=" * 60)
+    print("Austin Tee Time Bot — Pre-Flight Check")
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 50)
+    print("=" * 60)
 
     # 1. Env vars
     print("\n[1/5] Checking environment...")
@@ -42,21 +43,18 @@ def main() -> int:
         failures.append(f"Failed to load .env: {e}")
         print(f"  FAIL: {e}")
     else:
-        for key in ("GOLF_USERNAME", "GOLF_PASSWORD"):
-            if not os.getenv(key):
-                failures.append(f"Missing required env var: {key}")
-                print(f"  FAIL: missing {key}")
-            else:
-                print(f"  OK: {key} present")
         if not os.getenv("NTFY_TOPIC") and not os.getenv("SMTP_SERVER"):
             warnings.append("No notification channel configured (no NTFY_TOPIC or SMTP)")
             print(f"  WARN: no notifications configured")
+        else:
+            print(f"  OK: notifications configured")
 
-    # 2. Imports
-    print("\n[2/5] Checking Python deps...")
+    # 2. Imports + accounts.json
+    print("\n[2/5] Checking Python deps + accounts.json...")
     try:
         import bot  # noqa: F401
         import config  # noqa: F401
+        import shared_state  # noqa: F401
         from playwright.sync_api import sync_playwright  # noqa: F401
         try:
             from playwright_stealth import stealth_sync  # noqa: F401
@@ -67,28 +65,23 @@ def main() -> int:
         failures.append(f"Import failure: {e}")
         print(f"  FAIL: {e}")
         traceback.print_exc()
-        # If imports fail, nothing else will work
         _notify_and_exit(failures, warnings)
         return 1
 
+    accounts = bot.load_accounts()
+    if not accounts:
+        failures.append("No enabled accounts in accounts.json (or file missing)")
+        print("  FAIL: no enabled accounts")
+        _notify_and_exit(failures, warnings)
+        return 1
+    print(f"  OK: {len(accounts)} enabled account(s): {', '.join(a['display_name'] for a in accounts)}")
+
     # 3. Playwright browser launch
     print("\n[3/5] Checking Playwright browser launch...")
-    page = None
-    browser = None
-    playwright_ctx = None
     try:
         from playwright.sync_api import sync_playwright
-        try:
-            from playwright_stealth import stealth_sync
-        except ImportError:
-            from playwright_stealth import Stealth
-            stealth_sync = lambda page: Stealth().apply_stealth_sync(page)
-
         playwright_ctx = sync_playwright().start()
         browser = playwright_ctx.firefox.launch(headless=True)
-        context = browser.new_context(viewport={"width": 1280, "height": 900})
-        page = context.new_page()
-        stealth_sync(page)
         print("  OK: Firefox launched")
     except Exception as e:
         failures.append(f"Playwright launch failed: {e}")
@@ -97,62 +90,66 @@ def main() -> int:
         _notify_and_exit(failures, warnings)
         return 1
 
-    # 4. Site reachability + login
-    print("\n[4/5] Checking WebTrac site + login...")
+    # 4. Site reachability + login for each account
+    print(f"\n[4/5] Checking WebTrac login for {len(accounts)} account(s)...")
     try:
-        start = time.time()
-        page.goto("https://txaustinweb.myvscloud.com/webtrac/web",
-                  timeout=30000, wait_until="domcontentloaded")
-        load_time = time.time() - start
-        print(f"  OK: site loaded in {load_time:.1f}s")
+        from playwright_stealth import stealth_sync
+    except ImportError:
+        from playwright_stealth import Stealth
+        stealth_sync = lambda p: Stealth().apply_stealth_sync(p)
 
-        # Check for Queue-it (unusual this early; worth warning)
-        content_lower = ""
-        try:
-            content_lower = page.content().lower()
-        except Exception:
-            pass
-        if "queue-it.net" in page.url.lower() or "virtual waiting room" in content_lower:
-            warnings.append("Site is in Queue-it waiting room during preflight (unusual)")
-            print("  WARN: hit Queue-it early")
+    try:
+        for acc in accounts:
+            print(f"\n  → {acc['display_name']} (id={acc['id']})")
+            context = browser.new_context(viewport={"width": 1280, "height": 900})
+            page = context.new_page()
+            stealth_sync(page)
+            try:
+                start = time.time()
+                page.goto("https://txaustinweb.myvscloud.com/webtrac/web",
+                          timeout=30000, wait_until="domcontentloaded")
+                print(f"    site loaded in {time.time() - start:.1f}s")
 
-        # Try actual login
-        from dotenv import load_dotenv
-        load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
-        import bot as bot_mod
-        if bot_mod.login_once(page, queue_mode="timeout"):
-            print("  OK: login succeeded")
-        else:
-            failures.append("Login failed during preflight")
-            print("  FAIL: login failed")
-    except Exception as e:
-        failures.append(f"Site/login check failed: {e}")
-        print(f"  FAIL: {e}")
-        traceback.print_exc()
+                # Override bot credentials temporarily for this login test
+                bot.USERNAME = acc["username"]
+                bot.PASSWORD = acc["password"]
+                if bot.login_once(page, queue_mode="timeout"):
+                    print(f"    OK: login succeeded")
+                else:
+                    msg = f"Login failed for {acc['display_name']}"
+                    failures.append(msg)
+                    print(f"    FAIL: {msg}")
+            except Exception as e:
+                msg = f"Preflight error for {acc['display_name']}: {e}"
+                failures.append(msg)
+                print(f"    FAIL: {msg}")
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
     finally:
         try:
-            if page: page.close()
-            if browser: browser.close()
-            if playwright_ctx: playwright_ctx.stop()
+            browser.close()
+            playwright_ctx.stop()
         except Exception:
             pass
 
     # 5. Notification channel test
     print("\n[5/5] Testing notification delivery...")
     try:
-        import bot as bot_mod
-        if bot_mod.NTFY_TOPIC:
-            bot_mod.send_ntfy(
-                "Golf Bot preflight",
-                f"Preflight running at {datetime.now().strftime('%H:%M')} — "
-                "you should get a booking notification ~15 min from now.",
+        if bot.NTFY_TOPIC:
+            bot.send_ntfy(
+                "Preflight check",
+                f"{len(accounts)} account(s) verified at {datetime.now().strftime('%H:%M')} — "
+                "you should see booking notifications ~15 min from now.",
                 priority="low",
                 tags="airplane",
             )
             print("  OK: ntfy test sent")
-        elif bot_mod.SMTP_SERVER:
-            bot_mod.send_email(
-                "Golf Bot preflight check",
+        elif bot.SMTP_SERVER:
+            bot.send_email(
+                "Preflight check",
                 f"Preflight passed at {datetime.now().strftime('%H:%M')}",
             )
             print("  OK: email test sent")
@@ -168,20 +165,19 @@ def main() -> int:
 
 def _notify_and_exit(failures: list, warnings: list) -> None:
     """Send summary notification of preflight results."""
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     if failures:
         print(f"PREFLIGHT FAILED — {len(failures)} issue(s):")
         for f in failures:
-            print(f"  ❌ {f}")
+            print(f"  FAIL: {f}")
     if warnings:
         print(f"Warnings ({len(warnings)}):")
         for w in warnings:
-            print(f"  ⚠️  {w}")
+            print(f"  WARN: {w}")
     if not failures and not warnings:
         print("PREFLIGHT OK — ready for 8:00 PM")
-    print("=" * 50)
+    print("=" * 60)
 
-    # Notify on failure (high priority) — warnings alone don't need to wake user
     if failures:
         try:
             import bot as bot_mod
@@ -190,7 +186,7 @@ def _notify_and_exit(failures: list, warnings: list) -> None:
                 body += "\n\nWARNINGS:\n" + "\n".join(f"- {w}" for w in warnings)
             body += "\n\nFix before 8:00 PM or the bot won't book anything tonight."
             bot_mod.notify(
-                "Golf Bot PREFLIGHT FAILED",
+                "PREFLIGHT FAILED",
                 body,
                 priority="urgent",
                 tags="rotating_light",
@@ -203,13 +199,12 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:
-        # Catch-all — we still want to notify on catastrophic failure
         print(f"Preflight crashed: {e}")
         traceback.print_exc()
         try:
             import bot as bot_mod
             bot_mod.notify(
-                "Golf Bot PREFLIGHT CRASHED",
+                "PREFLIGHT CRASHED",
                 f"Preflight script itself crashed:\n{e}\n\n{traceback.format_exc()[:500]}",
                 priority="urgent",
                 tags="rotating_light",

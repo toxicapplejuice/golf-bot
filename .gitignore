@@ -5,8 +5,14 @@ __pycache__/
 *.png
 *.html
 booking.log
+booking_*.log
+preflight.log
+multi_bot.log
 .claude/
 .pytest_cache/
 
 state.json
+state_*.json
 history.json
+shared_state.json
+accounts.json
