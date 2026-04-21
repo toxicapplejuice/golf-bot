@@ -134,6 +134,17 @@ NOTIFICATION_EMAIL=...
 7. Sunday inherits a `exclude_course` hint from Saturday's successful
    booking, so you don't accidentally book the same course both days.
 
+## Sharing the live dashboard with friends
+
+Run `./share_dashboard.sh` from the repo root. It starts the monitor if
+needed, spins up a Cloudflare Quick Tunnel, and prints a share-able
+`https://<random>.trycloudflare.com` URL. Anyone on the internet with
+that URL can view the dashboard. `Ctrl+C` stops both.
+
+- Requires `cloudflared` (install: `brew install cloudflared`)
+- URL changes each run (quick tunnels don't persist names)
+- For a stable URL, set up a named tunnel with a custom domain
+
 ## Debugging a failed run
 
 1. Tail `booking.log` — the per-step labeled logs in `login_once` will
