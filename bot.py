@@ -14,6 +14,7 @@ import os
 import re
 import smtplib
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime, timedelta
@@ -104,13 +105,19 @@ def send_ntfy(title: str, message: str, priority: str = "default",
     """Send a push notification via ntfy.sh.
 
     priority: "min", "low", "default", "high", "urgent"
-    tags: comma-separated emoji tags, e.g. "golf,white_check_mark"
+    tags: comma-separated emoji shortcodes (ntfy renders these), e.g.
+          "golf,white_check_mark" — use these for emoji instead of putting
+          them in the title, because HTTP headers must be latin-1 (ASCII-safe).
     """
     if not NTFY_TOPIC:
         return
     url = f"{NTFY_SERVER.rstrip('/')}/{NTFY_TOPIC}"
+    # Title must be ASCII-safe (HTTP header limitation). Strip non-latin-1 chars
+    # rather than failing — any emoji the caller passed here should come through
+    # via the `tags` parameter instead.
+    safe_title = title.encode("latin-1", errors="ignore").decode("latin-1")
     headers = {
-        "Title": title,
+        "Title": safe_title,
         "Priority": priority,
     }
     if tags:
@@ -120,7 +127,7 @@ def send_ntfy(title: str, message: str, priority: str = "default",
             url, data=message.encode("utf-8"), headers=headers, method="POST"
         )
         urllib.request.urlopen(req, timeout=10)
-        print(f"ntfy sent: {title}")
+        print(f"ntfy sent: {safe_title}")
     except Exception as e:
         print(f"Failed to send ntfy: {e}")
 
@@ -150,6 +157,86 @@ def save_debug_screenshot(page, label: str) -> None:
         print(f"  [debug] Screenshot saved: {path}")
     except Exception as e:
         print(f"  [debug] Screenshot failed ({label}): {e}")
+
+
+# Rolling "what the bot sees right now" snapshot — overwritten on every call.
+# The dashboard reads this file to render a live browser view.
+LIVE_SCREENSHOT = os.path.join(DEBUG_DIR, "live.png")
+
+# Watchdog: if the log hasn't been written to in this many seconds, alert.
+WATCHDOG_STALL_SECONDS = 90
+WATCHDOG_CHECK_INTERVAL_SECONDS = 30
+BOOKING_LOG_PATH = os.path.join(SCRIPT_DIR, "booking.log")
+
+
+class Watchdog:
+    """Background thread that notifies if the booking.log stops being written.
+
+    Uses the log file's mtime as the heartbeat — the bot writes via print()
+    and log redirection, so if the file is stale the bot is stalled. This
+    is thread-safe (we never touch the Playwright page from here).
+    """
+
+    def __init__(self, log_path: str = BOOKING_LOG_PATH,
+                 stall_seconds: int = WATCHDOG_STALL_SECONDS):
+        self.log_path = log_path
+        self.stall_seconds = stall_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread = None
+        self._notified = False  # debounce — only notify once per stall
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                         name="watchdog")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(WATCHDOG_CHECK_INTERVAL_SECONDS):
+            try:
+                if not os.path.exists(self.log_path):
+                    continue
+                mtime = os.path.getmtime(self.log_path)
+                age = time.time() - mtime
+                if age > self.stall_seconds:
+                    if not self._notified:
+                        self._notified = True
+                        send_ntfy(
+                            "Golf Bot: possibly stuck",
+                            f"No log activity for {int(age)}s. Check the bot — "
+                            f"it may be hung. (Watchdog threshold: {self.stall_seconds}s)",
+                            priority="urgent",
+                            tags="rotating_light",
+                        )
+                else:
+                    # Reset so we can re-alert if it stalls again
+                    self._notified = False
+            except Exception:
+                pass  # watchdog must never take down the bot
+
+
+def update_live_screenshot(page, label: str = "") -> None:
+    """Overwrite the live snapshot the dashboard displays. Cheap + best-effort."""
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        page.screenshot(path=LIVE_SCREENSHOT, full_page=False, timeout=3000)
+        # Also write a label file for the dashboard to display
+        with open(os.path.join(DEBUG_DIR, "live_label.txt"), "w") as f:
+            f.write(f"{datetime.now().strftime('%H:%M:%S')} — {label}")
+    except Exception:
+        pass  # screenshots must never block booking
+
+
+def clear_live_screenshot() -> None:
+    """Remove the live snapshot when the bot finishes so the dashboard shows 'idle'."""
+    for path in (LIVE_SCREENSHOT, os.path.join(DEBUG_DIR, "live_label.txt")):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
 
 
 # ======================================================================
@@ -329,9 +416,11 @@ def wait_for_queue(page, mode: str = "timeout",
                 return False
             if not is_in_queue(page):
                 print(f"  [queue] Released! URL: {page.url[:60]}")
+                update_live_screenshot(page, "through Queue-it")
                 return True
             remaining = int((deadline - now).total_seconds())
             print(f"  [queue] Still waiting... ({remaining}s until deadline)")
+            update_live_screenshot(page, f"Queue-it: {remaining}s until deadline")
             page.wait_for_timeout(check_interval_ms)
 
     start = time.time()
@@ -339,9 +428,11 @@ def wait_for_queue(page, mode: str = "timeout",
     while time.time() - start < max_wait_seconds:
         if not is_in_queue(page):
             print(f"  [queue] Released! URL: {page.url[:60]}")
+            update_live_screenshot(page, "through Queue-it")
             return True
         elapsed = int(time.time() - start)
         print(f"  [queue] Still waiting... ({elapsed}s elapsed)")
+        update_live_screenshot(page, f"Queue-it: {elapsed}s waiting")
         page.wait_for_timeout(check_interval_ms)
     print(f"  [queue] Timeout after {max_wait_seconds}s")
     return False
@@ -411,6 +502,7 @@ def login_once(page, queue_mode: str = "timeout") -> bool:
                 lambda: page.goto(BASE_URL, timeout=60000, wait_until="domcontentloaded")):
         return False
     print(f"  [login] Page: {page.title()[:60]} | URL: {page.url[:80]}")
+    update_live_screenshot(page, f"login: {page.title()[:40]}")
 
     if not handle_queue_if_present():
         return False
@@ -470,6 +562,7 @@ def login_once(page, queue_mode: str = "timeout") -> bool:
         print(f"  [login] Not clearly authenticated (URL: {page.url[:80]}) — continuing")
 
     print("  [login] Success!")
+    update_live_screenshot(page, "logged in")
     return True
 
 
@@ -849,6 +942,7 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
 
     print(f"  [search] {course_name}: {len(slots)} slot(s) — "
           f"{', '.join(s['time'] for s in slots[:5])}")
+    update_live_screenshot(page, f"{course_name}: {len(slots)} slots found")
 
     for slot in slots:
         key = (slot["date"], slot["course"], slot["time"])
@@ -856,7 +950,9 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
             continue
 
         print(f"  [book] {slot['time']} at {course_name}...", end=" ", flush=True)
+        update_live_screenshot(page, f"attempting {slot['time']} at {course_name}")
         status = attempt_booking_click(page, slot, dry_run=dry_run)
+        update_live_screenshot(page, f"{slot['time']} @ {course_name}: {status}")
 
         if status == "booked":
             print("BOOKED! — verifying...", end=" ", flush=True)
@@ -950,7 +1046,17 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
 
     if not login_with_retry(page, queue_mode=queue_mode):
         print("Login failed — session will retry")
+        # Only notify on persistent login failures, not every attempt
+        if not is_first_session:
+            send_ntfy("Golf Bot: login failing",
+                      "Repeated login failures — session will retry. Check the logs.",
+                      priority="high", tags="warning")
         return False
+
+    if is_first_session:
+        send_ntfy("Golf Bot: logged in",
+                  "Through login + Queue-it. Now waiting for 8:00 PM release.",
+                  priority="low", tags="white_check_mark")
 
     if not skip_wait:
         wait_until_release_time()
@@ -959,6 +1065,9 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
     if not is_authenticated(page):
         print("Session no longer authenticated after release-wait — re-authenticating")
         if not login_with_retry(page, queue_mode="timeout"):
+            send_ntfy("Golf Bot: re-auth failed after 8 PM",
+                      "Session expired during wait and re-login failed. Bot will retry.",
+                      priority="high", tags="warning")
             return False
 
     blacklist: set = set()
@@ -988,6 +1097,11 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
         # Persist state after each day — survives a crash mid-run
         if results[day_key]["success"]:
             save_state(saturday_date, sunday_date, results)
+            send_ntfy(
+                f"Golf Bot: {day_name.capitalize()} booked",
+                f"{results[day_key]['details']}",
+                priority="default", tags="golf,white_check_mark",
+            )
 
     book_day("saturday", saturday_date, "saturday")
     book_day("sunday", sunday_date, "sunday",
@@ -1011,11 +1125,24 @@ def run_booking(args) -> dict:
     results = load_state(saturday_date, sunday_date)
 
     print(f"Target dates: Saturday {saturday_date}, Sunday {sunday_date}")
+
+    # Launch notification — only when skipping-wait is off (real scheduled runs)
+    if not args.now:
+        send_ntfy(
+            "Golf Bot: launched",
+            f"Running for Sat {saturday_date} / Sun {sunday_date}. "
+            "Will book 4 players, falling back to 2 if needed.",
+            priority="low", tags="rocket",
+        )
     print(f"Players: {args.players} | Max time: {args.max_time}s | "
           f"Dry run: {args.dry_run} | Headful: {args.headful}")
 
     start_time = time.time()
     session_count = 0
+
+    # Watchdog — urgent notification if the bot appears stuck
+    watchdog = Watchdog()
+    watchdog.start()
 
     with sync_playwright() as p:
         browser = p.firefox.launch(headless=not args.headful)
@@ -1079,6 +1206,7 @@ def run_booking(args) -> dict:
                 browser.close()
             except Exception:
                 pass
+            watchdog.stop()
 
     subject_parts = []
     body_lines = [f"Golf Booking Results for {saturday_date} and {sunday_date}\n"]
@@ -1095,15 +1223,15 @@ def run_booking(args) -> dict:
     any_booked = results["saturday"]["success"] or results["sunday"]["success"]
 
     if both_booked:
-        title = "🏌️ Golf Bot: Both days booked!"
+        title = "Golf Bot: Both days booked!"
         tags = "golf,white_check_mark"
         priority = "default"
     elif any_booked:
-        title = "⚠️ Golf Bot: Partial success"
+        title = "Golf Bot: Partial success"
         tags = "golf,warning"
         priority = "high"
     else:
-        title = "❌ Golf Bot: No bookings made"
+        title = "Golf Bot: No bookings made"
         tags = "golf,x"
         priority = "high"
 
@@ -1113,6 +1241,7 @@ def run_booking(args) -> dict:
     if both_booked:
         clear_state()
 
+    clear_live_screenshot()
     return results
 
 

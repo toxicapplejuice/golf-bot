@@ -7,10 +7,31 @@ Then open: http://localhost:8111
 
 import http.server
 import json
+import mimetypes
 import os
+from datetime import datetime, timedelta
 
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "booking.log")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(SCRIPT_DIR, "booking.log")
+LIVE_SCREENSHOT = os.path.join(SCRIPT_DIR, "debug_screenshots", "live.png")
+LIVE_LABEL = os.path.join(SCRIPT_DIR, "debug_screenshots", "live_label.txt")
 PORT = 8111
+
+
+def seconds_until_next_monday_745pm() -> int:
+    """Return seconds until the next Monday 7:45 PM local time."""
+    now = datetime.now()
+    target_weekday = 0  # Monday
+    target_hour, target_minute = 19, 45
+    # Days until next Monday
+    days_ahead = (target_weekday - now.weekday()) % 7
+    candidate = (now + timedelta(days=days_ahead)).replace(
+        hour=target_hour, minute=target_minute, second=0, microsecond=0
+    )
+    if candidate <= now:
+        candidate += timedelta(days=7)
+    return int((candidate - now).total_seconds())
+
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -33,20 +54,19 @@ HTML = """<!DOCTYPE html>
     width: 12px; height: 12px; border-radius: 50%;
     background: #484f58; animation: none;
   }
-  .status-dot.active {
-    background: #3fb950; animation: pulse 2s infinite;
-  }
-  .status-dot.success {
-    background: #3fb950; animation: none;
-  }
-  .status-dot.failed {
-    background: #f85149; animation: none;
-  }
+  .status-dot.active { background: #3fb950; animation: pulse 2s infinite; }
+  .status-dot.success { background: #3fb950; }
+  .status-dot.failed { background: #f85149; }
   @keyframes pulse {
     0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.4); }
     50% { opacity: 0.8; box-shadow: 0 0 0 8px rgba(63, 185, 80, 0); }
   }
   .status-text { font-size: 14px; color: #8b949e; }
+  .next-run-badge {
+    margin-left: auto; font-size: 12px; color: #8b949e;
+    background: #0d1117; padding: 6px 12px; border-radius: 6px;
+    border: 1px solid #30363d;
+  }
   .cards { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
   .card {
     background: #161b22; border: 1px solid #30363d; border-radius: 10px;
@@ -57,16 +77,37 @@ HTML = """<!DOCTYPE html>
   .card-value.booked { color: #3fb950; }
   .card-value.pending { color: #d29922; }
   .card-value.failed { color: #f85149; }
-  .log-container {
-    background: #0d1117; border: 1px solid #30363d; border-radius: 12px;
-    overflow: hidden;
+  .main-layout {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
   }
-  .log-header {
+  @media (max-width: 1100px) { .main-layout { grid-template-columns: 1fr; } }
+  .panel {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 12px;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .panel-header {
     padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d;
     font-size: 13px; color: #8b949e; display: flex; justify-content: space-between;
   }
+  .browser-view {
+    padding: 12px; display: flex; flex-direction: column; gap: 8px;
+    max-height: calc(100vh - 320px);
+  }
+  .browser-view img {
+    width: 100%; border-radius: 6px; border: 1px solid #30363d;
+    background: #161b22; display: block;
+  }
+  .browser-view .label {
+    font-size: 12px; color: #8b949e; padding: 4px 8px;
+    background: #161b22; border-radius: 6px;
+  }
+  .browser-view .empty-img {
+    aspect-ratio: 16 / 10; display: flex; align-items: center; justify-content: center;
+    color: #484f58; font-style: italic; text-align: center; padding: 20px;
+    border: 1px dashed #30363d; border-radius: 6px;
+  }
   .log-content {
-    padding: 16px; overflow-y: auto; max-height: calc(100vh - 280px);
+    padding: 16px; overflow-y: auto; max-height: calc(100vh - 320px);
     font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
   }
   .line { padding: 1px 0; }
@@ -87,6 +128,7 @@ HTML = """<!DOCTYPE html>
   <div class="status-dot" id="statusDot"></div>
   <h1>Golf Bot Monitor</h1>
   <span class="status-text" id="statusText">Waiting for data...</span>
+  <span class="next-run-badge" id="nextRun">Next run: --</span>
 </div>
 
 <div class="cards">
@@ -107,7 +149,7 @@ HTML = """<!DOCTYPE html>
     <div class="card-value" id="players">--</div>
   </div>
   <div class="card">
-    <div class="card-label">Countdown</div>
+    <div class="card-label">Countdown to 8pm</div>
     <div class="card-value" id="countdown" style="font-size:16px">--</div>
   </div>
   <div class="card">
@@ -116,23 +158,59 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<div class="log-container">
-  <div class="log-header">
-    <span>Live Log</span>
-    <span id="lineCount">0 lines</span>
+<div class="main-layout">
+
+  <div class="panel">
+    <div class="panel-header">
+      <span>Browser View (what the bot sees)</span>
+      <span id="browserLabel">no screenshot yet</span>
+    </div>
+    <div class="browser-view">
+      <img id="browserImg" src="/api/screenshot" style="display:none" alt="live screenshot">
+      <div class="empty-img" id="browserEmpty">
+        Bot isn't running.<br>Screenshot will appear here when the bot takes one.
+      </div>
+    </div>
   </div>
-  <div class="log-content" id="logContent">
-    <div class="empty">Waiting for bot to start... Log will appear here automatically.</div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <span>Live Log</span>
+      <span id="lineCount">0 lines</span>
+    </div>
+    <div class="log-content" id="logContent">
+      <div class="empty">Waiting for bot to start...</div>
+    </div>
   </div>
+
 </div>
 
 <script>
 let prevLength = 0;
+let prevScreenshotTs = 0;
+let nextRunSeconds = 0;
+
+function formatDuration(totalSeconds) {
+  if (totalSeconds < 60) return totalSeconds + 's';
+  if (totalSeconds < 3600) {
+    const m = Math.floor(totalSeconds / 60);
+    const s = totalSeconds % 60;
+    return m + 'm ' + s + 's';
+  }
+  if (totalSeconds < 86400) {
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    return h + 'h ' + m + 'm';
+  }
+  const d = Math.floor(totalSeconds / 86400);
+  const h = Math.floor((totalSeconds % 86400) / 3600);
+  return d + 'd ' + h + 'h';
+}
 
 function classifyLine(text) {
   const t = text.toLowerCase();
-  if (t.includes('booked!') || t.includes('success') || t.includes('dry-run ok')) return 'highlight-book';
-  if (t.includes('failed') || t.includes('error') || t.includes('timeout')) return 'highlight-error';
+  if (t.includes('booked!') || t.includes('verified') || t.includes('dry-run ok')) return 'highlight-book';
+  if (t.includes('failed') || t.includes('error') || t.includes('timeout') || t.includes('crash')) return 'highlight-error';
   if (t.includes('[search]')) return 'highlight-search';
   if (t.includes('[queue]')) return 'highlight-queue';
   if (t.includes('[login]') || t.includes('logging in') || t.includes('login attempt')) return 'highlight-login';
@@ -153,21 +231,17 @@ function parseResults(lines) {
   for (const line of lines) {
     const t = line.toLowerCase();
 
-    // Session tracking
     const sessionMatch = line.match(/SESSION (\\d+)/);
     if (sessionMatch) { session = '#' + sessionMatch[1]; isRunning = true; }
 
-    // Players
     const playerMatch = line.match(/Players:\\s*(\\d+)/);
     if (playerMatch) { players = playerMatch[1]; }
 
-    // Fallback player detection
     if (t.includes('retrying with') && t.includes('players')) {
       const fbMatch = line.match(/retrying with (\\d+) players/i);
       if (fbMatch) players = fbMatch[1] + ' (fallback)';
     }
 
-    // Phase detection — later lines overwrite earlier ones
     if (t.includes('austin golf tee time')) { phase = 'Starting up'; phaseClass = ''; }
     if (t.includes('logging in')) { phase = 'Logging in'; phaseClass = 'pending'; }
     if (t.includes('[login] success')) { phase = 'Logged in'; phaseClass = 'booked'; }
@@ -183,10 +257,10 @@ function parseResults(lines) {
     if (t.includes('morning pass')) { phase = phase.split(' —')[0] + ' — morning'; phaseClass = 'pending'; }
     if (t.includes('fallback pass')) { phase = phase.split(' —')[0] + ' — afternoon'; phaseClass = 'pending'; }
     if (t.includes('[recovery]')) { phase = 'Recovering...'; phaseClass = 'failed'; }
+    if (t.includes('verified')) { phase = 'Verified booking'; phaseClass = 'booked'; }
     if (t.includes('final results')) { phase = 'Done'; phaseClass = 'booked'; }
     if (t.includes('max time') && t.includes('exceeded')) { phase = 'Timed out'; phaseClass = 'failed'; }
 
-    // Countdown to release
     const countdownMatch = line.match(/(\\d+)s until release/);
     if (countdownMatch) {
       const secs = parseInt(countdownMatch[1]);
@@ -196,7 +270,6 @@ function parseResults(lines) {
     }
     if (t.includes('release time reached') || t.includes('already past release')) { countdown = 'GO!'; }
 
-    // Saturday/Sunday results
     if (t.includes('saturday') && t.includes('success')) {
       const detail = line.match(/SUCCESS.*?[—-]\\s*(.+)/);
       sat = detail ? detail[1].trim() : 'Booked'; satClass = 'booked';
@@ -208,28 +281,20 @@ function parseResults(lines) {
     if (t.includes('saturday') && t.includes('no booking')) { sat = 'No booking'; satClass = 'failed'; }
     if (t.includes('sunday') && t.includes('no booking')) { sun = 'No booking'; sunClass = 'failed'; }
 
-    // In-progress detection
     if (t.includes('booking saturday') && sat === '--') { sat = 'Searching...'; satClass = 'pending'; }
     if (t.includes('booking sunday') && sun === '--') { sun = 'Searching...'; sunClass = 'pending'; }
 
-    // Booked mid-log (before final results)
-    if (t.includes('booked!')) {
-      const bookDetail = line.match(/\\[book\\]\\s*(.+?)\\.\\.\\./i);
-      if (bookDetail) {
-        // Figure out which day based on current phase
-        if (phase.toLowerCase().includes('sunday')) {
-          sun = bookDetail[1].trim() + ' ✓'; sunClass = 'booked';
-        } else {
-          sat = bookDetail[1].trim() + ' ✓'; satClass = 'booked';
-        }
-      }
+    if (t.includes('verified')) {
+      const v = line.match(/VERIFIED/i);
+      if (v && phase.toLowerCase().includes('sunday')) { sun = (sun.replace(' ✓','')) + ' ✓'; sunClass = 'booked'; }
+      else if (v) { sat = (sat.replace(' ✓','')) + ' ✓'; satClass = 'booked'; }
     }
   }
 
   return { sat, sun, satClass, sunClass, session, isRunning, phase, phaseClass, countdown, players };
 }
 
-async function refresh() {
+async function refreshLog() {
   try {
     const resp = await fetch('/api/log');
     const data = await resp.json();
@@ -287,12 +352,57 @@ async function refresh() {
   } catch (e) {}
 }
 
+async function refreshScreenshot() {
+  try {
+    const resp = await fetch('/api/screenshot_info');
+    const info = await resp.json();
+    const img = document.getElementById('browserImg');
+    const empty = document.getElementById('browserEmpty');
+    const label = document.getElementById('browserLabel');
+
+    if (info.exists) {
+      img.src = '/api/screenshot?t=' + info.mtime;
+      img.style.display = 'block';
+      empty.style.display = 'none';
+      label.textContent = info.label || ('updated ' + new Date(info.mtime * 1000).toLocaleTimeString());
+    } else {
+      img.style.display = 'none';
+      empty.style.display = 'flex';
+      label.textContent = 'no screenshot yet';
+    }
+  } catch (e) {}
+}
+
+async function refreshNextRun() {
+  try {
+    const resp = await fetch('/api/next_run');
+    const info = await resp.json();
+    nextRunSeconds = info.seconds;
+    tickNextRun();
+  } catch (e) {}
+}
+
+function tickNextRun() {
+  if (nextRunSeconds > 0) nextRunSeconds -= 1;
+  const el = document.getElementById('nextRun');
+  if (nextRunSeconds <= 0) {
+    el.textContent = 'Next run: now!';
+  } else {
+    el.textContent = 'Next run in ' + formatDuration(nextRunSeconds);
+  }
+}
+
 function escapeHtml(t) {
   return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-setInterval(refresh, 1000);
-refresh();
+setInterval(refreshLog, 1000);
+setInterval(refreshScreenshot, 2000);
+setInterval(tickNextRun, 1000);
+setInterval(refreshNextRun, 60000);  // resync each minute
+refreshLog();
+refreshScreenshot();
+refreshNextRun();
 </script>
 </body>
 </html>"""
@@ -300,26 +410,65 @@ refresh();
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/api/log":
+        path = self.path.split("?")[0]
+
+        if path == "/api/log":
             lines = []
             try:
                 with open(LOG_FILE, "r") as f:
                     lines = [l.rstrip("\n") for l in f.readlines()]
             except FileNotFoundError:
                 pass
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(json.dumps({"lines": lines}).encode())
-        elif self.path == "/" or self.path == "":
+            self._json({"lines": lines})
+
+        elif path == "/api/screenshot_info":
+            info = {"exists": False, "mtime": 0, "label": ""}
+            if os.path.exists(LIVE_SCREENSHOT):
+                info["exists"] = True
+                info["mtime"] = int(os.path.getmtime(LIVE_SCREENSHOT))
+                try:
+                    with open(LIVE_LABEL, "r") as f:
+                        info["label"] = f.read().strip()
+                except Exception:
+                    pass
+            self._json(info)
+
+        elif path == "/api/screenshot":
+            if not os.path.exists(LIVE_SCREENSHOT):
+                self.send_response(404)
+                self.end_headers()
+                return
+            try:
+                with open(LIVE_SCREENSHOT, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                self.send_response(500)
+                self.end_headers()
+
+        elif path == "/api/next_run":
+            self._json({"seconds": seconds_until_next_monday_745pm()})
+
+        elif path in ("/", ""):
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             self.wfile.write(HTML.encode())
+
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _json(self, obj):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode())
 
     def log_message(self, format, *args):
         pass  # suppress request logs

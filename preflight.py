@@ -143,7 +143,7 @@ def main() -> int:
         import bot as bot_mod
         if bot_mod.NTFY_TOPIC:
             bot_mod.send_ntfy(
-                "✈️ Golf Bot preflight",
+                "Golf Bot preflight",
                 f"Preflight running at {datetime.now().strftime('%H:%M')} — "
                 "you should get a booking notification ~15 min from now.",
                 priority="low",
@@ -190,7 +190,7 @@ def _notify_and_exit(failures: list, warnings: list) -> None:
                 body += "\n\nWARNINGS:\n" + "\n".join(f"- {w}" for w in warnings)
             body += "\n\nFix before 8:00 PM or the bot won't book anything tonight."
             bot_mod.notify(
-                "🚨 Golf Bot PREFLIGHT FAILED",
+                "Golf Bot PREFLIGHT FAILED",
                 body,
                 priority="urgent",
                 tags="rotating_light",
@@ -209,7 +209,7 @@ if __name__ == "__main__":
         try:
             import bot as bot_mod
             bot_mod.notify(
-                "🚨 Golf Bot PREFLIGHT CRASHED",
+                "Golf Bot PREFLIGHT CRASHED",
                 f"Preflight script itself crashed:\n{e}\n\n{traceback.format_exc()[:500]}",
                 priority="urgent",
                 tags="rotating_light",
