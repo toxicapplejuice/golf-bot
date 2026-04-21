@@ -7,7 +7,6 @@ Then open: http://localhost:8111
 
 import http.server
 import json
-import mimetypes
 import os
 from datetime import datetime, timedelta
 
@@ -24,7 +23,6 @@ def seconds_until_next_monday_745pm() -> int:
     now = datetime.now()
     target_weekday = 0  # Monday
     target_hour, target_minute = 19, 45
-    # Days until next Monday
     days_ahead = (target_weekday - now.weekday()) % 7
     candidate = (now + timedelta(days=days_ahead)).replace(
         hour=target_hour, minute=target_minute, second=0, microsecond=0
@@ -38,294 +36,379 @@ HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Golf Bot Monitor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Golf Bot</title>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: #0d1117; color: #c9d1d9; font-family: 'SF Mono', 'Consolas', monospace;
-    padding: 20px; min-height: 100vh;
+  :root {
+    --bg: #09090b;
+    --surface: #18181b;
+    --surface-2: #27272a;
+    --border: #27272a;
+    --border-strong: #3f3f46;
+    --text: #fafafa;
+    --text-muted: #a1a1aa;
+    --text-subtle: #71717a;
+    --success: #22c55e;
+    --success-bg: rgba(34, 197, 94, 0.1);
+    --danger: #ef4444;
+    --danger-bg: rgba(239, 68, 68, 0.1);
+    --warning: #eab308;
+    --warning-bg: rgba(234, 179, 8, 0.1);
+    --accent: #3b82f6;
   }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    min-height: 100vh;
+  }
+
+  .container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 32px 24px;
+  }
+
+  /* Header */
   .header {
     display: flex; align-items: center; gap: 16px;
-    padding: 16px 20px; margin-bottom: 20px;
-    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    margin-bottom: 32px; padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
   }
-  .header h1 { font-size: 20px; color: #f0f6fc; font-weight: 600; }
+  .header h1 {
+    font-size: 20px; font-weight: 600; letter-spacing: -0.02em;
+  }
   .status-dot {
-    width: 12px; height: 12px; border-radius: 50%;
-    background: #484f58; animation: none;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text-subtle);
+    flex-shrink: 0;
   }
-  .status-dot.active { background: #3fb950; animation: pulse 2s infinite; }
-  .status-dot.success { background: #3fb950; }
-  .status-dot.failed { background: #f85149; }
+  .status-dot.active {
+    background: var(--success); animation: pulse 2s infinite;
+  }
+  .status-dot.success { background: var(--success); }
+  .status-dot.failed { background: var(--danger); }
   @keyframes pulse {
-    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.4); }
-    50% { opacity: 0.8; box-shadow: 0 0 0 8px rgba(63, 185, 80, 0); }
+    0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
+    50% { box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
   }
-  .status-text { font-size: 14px; color: #8b949e; }
-  .next-run-badge {
-    margin-left: auto; font-size: 12px; color: #8b949e;
-    background: #0d1117; padding: 6px 12px; border-radius: 6px;
-    border: 1px solid #30363d;
+  .status-text {
+    font-size: 13px; color: var(--text-muted);
   }
-  .cards { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
-  .card {
-    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
-    padding: 14px 18px; flex: 1; min-width: 180px;
+  .next-run {
+    margin-left: auto; font-size: 13px; color: var(--text-muted);
+    display: flex; align-items: center; gap: 8px;
   }
-  .card-label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
-  .card-value { font-size: 22px; color: #f0f6fc; margin-top: 4px; font-weight: 600; }
-  .card-value.booked { color: #3fb950; }
-  .card-value.pending { color: #d29922; }
-  .card-value.failed { color: #f85149; }
-  .main-layout {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
-  }
-  @media (max-width: 1100px) { .main-layout { grid-template-columns: 1fr; } }
-  .panel {
-    background: #0d1117; border: 1px solid #30363d; border-radius: 12px;
-    overflow: hidden; display: flex; flex-direction: column;
-  }
-  .panel-header {
-    padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d;
-    font-size: 13px; color: #8b949e; display: flex; justify-content: space-between;
-  }
-  .browser-view {
-    padding: 12px; display: flex; flex-direction: column; gap: 8px;
-    max-height: calc(100vh - 320px);
-  }
-  .browser-view img {
-    width: 100%; border-radius: 6px; border: 1px solid #30363d;
-    background: #161b22; display: block;
-  }
-  .browser-view .label {
-    font-size: 12px; color: #8b949e; padding: 4px 8px;
-    background: #161b22; border-radius: 6px;
-  }
-  .browser-view .empty-img {
-    aspect-ratio: 16 / 10; display: flex; align-items: center; justify-content: center;
-    color: #484f58; font-style: italic; text-align: center; padding: 20px;
-    border: 1px dashed #30363d; border-radius: 6px;
-  }
-  .log-content {
-    padding: 16px; overflow-y: auto; max-height: calc(100vh - 320px);
-    font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
-  }
-  .line { padding: 1px 0; }
-  .line:hover { background: #161b22; }
-  .line.highlight-book { color: #3fb950; font-weight: 600; }
-  .line.highlight-error { color: #f85149; }
-  .line.highlight-search { color: #79c0ff; }
-  .line.highlight-queue { color: #d2a8ff; }
-  .line.highlight-login { color: #d29922; }
-  .line.highlight-header { color: #f0f6fc; font-weight: 600; }
-  .line.highlight-wait { color: #8b949e; }
-  .empty { color: #484f58; font-style: italic; padding: 40px; text-align: center; }
-  .history-panel {
-    margin-top: 20px;
-    background: #0d1117; border: 1px solid #30363d; border-radius: 12px;
+  .next-run-value { color: var(--text); font-weight: 500; }
+
+  /* Stat grid */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 8px;
     overflow: hidden;
+    margin-bottom: 24px;
   }
+  .stat {
+    background: var(--bg);
+    padding: 16px 20px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .stat-label {
+    font-size: 11px; font-weight: 500; color: var(--text-subtle);
+    text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .stat-value {
+    font-size: 15px; font-weight: 500; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .stat-value.success { color: var(--success); }
+  .stat-value.danger { color: var(--danger); }
+  .stat-value.warning { color: var(--warning); }
+  .stat-value.muted { color: var(--text-muted); font-weight: 400; }
+
+  /* Main grid */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  @media (max-width: 900px) { .main-grid { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+  .card-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 13px;
+  }
+  .card-title { font-weight: 500; color: var(--text); }
+  .card-meta { color: var(--text-subtle); font-size: 12px; }
+
+  /* Browser view */
+  .browser-body { padding: 12px; }
+  .browser-body img {
+    width: 100%; display: block; border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  .browser-empty {
+    aspect-ratio: 16 / 10;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-subtle); text-align: center; font-size: 13px;
+    border: 1px dashed var(--border);
+    border-radius: 4px;
+  }
+
+  /* Log */
+  .log-body {
+    padding: 12px 16px;
+    overflow-y: auto;
+    max-height: 520px;
+    font-family: ui-monospace, "SF Mono", "Menlo", "Monaco", monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .log-body::-webkit-scrollbar { width: 8px; }
+  .log-body::-webkit-scrollbar-track { background: var(--bg); }
+  .log-body::-webkit-scrollbar-thumb { background: var(--surface-2); border-radius: 4px; }
+  .line { padding: 0 4px; color: var(--text-muted); }
+  .line.log-success { color: var(--success); }
+  .line.log-error { color: var(--danger); }
+  .line.log-warn { color: var(--warning); }
+  .line.log-header { color: var(--text); font-weight: 500; }
+  .line.log-dim { color: var(--text-subtle); }
+  .empty-state {
+    padding: 48px 24px; color: var(--text-subtle);
+    text-align: center; font-size: 13px;
+  }
+
+  /* History */
   .history-table {
     width: 100%; border-collapse: collapse; font-size: 13px;
   }
   .history-table th {
-    text-align: left; padding: 10px 16px; background: #161b22;
-    color: #8b949e; font-weight: 500; font-size: 11px;
-    text-transform: uppercase; letter-spacing: 1px;
-    border-bottom: 1px solid #30363d;
+    text-align: left;
+    padding: 10px 16px;
+    color: var(--text-subtle);
+    font-size: 11px; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 0.05em;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
   }
   .history-table td {
-    padding: 12px 16px; border-bottom: 1px solid #21262d; color: #c9d1d9;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
   }
   .history-table tr:last-child td { border-bottom: none; }
-  .history-table tr:hover td { background: #161b22; }
-  .history-booked { color: #3fb950; }
-  .history-failed { color: #f85149; }
-  .history-partial { color: #d29922; }
-  .history-empty { padding: 30px; color: #484f58; font-style: italic; text-align: center; }
+  .history-table tr:hover td { background: rgba(255, 255, 255, 0.02); }
+  .history-table td.muted { color: var(--text-muted); }
+
+  /* Badges */
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px; font-weight: 500;
+    white-space: nowrap;
+  }
+  .badge.success { background: var(--success-bg); color: var(--success); }
+  .badge.danger { background: var(--danger-bg); color: var(--danger); }
+  .badge.warning { background: var(--warning-bg); color: var(--warning); }
+  .badge.neutral { background: var(--surface); color: var(--text-muted); }
+  .badge-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+  }
+
+  .overall-badge {
+    padding: 3px 8px; font-size: 11px;
+  }
 </style>
 </head>
 <body>
 
-<div class="header">
-  <div class="status-dot" id="statusDot"></div>
-  <h1>Golf Bot Monitor</h1>
-  <span class="status-text" id="statusText">Waiting for data...</span>
-  <span class="next-run-badge" id="nextRun">Next run: --</span>
-</div>
+<div class="container">
 
-<div class="cards">
-  <div class="card">
-    <div class="card-label">Current Phase</div>
-    <div class="card-value" id="phase" style="font-size:16px">Waiting to start</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Saturday</div>
-    <div class="card-value pending" id="satResult">--</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Sunday</div>
-    <div class="card-value pending" id="sunResult">--</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Players</div>
-    <div class="card-value" id="players">--</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Countdown to 8pm</div>
-    <div class="card-value" id="countdown" style="font-size:16px">--</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Last Update</div>
-    <div class="card-value" id="lastUpdate" style="font-size:16px">--</div>
-  </div>
-</div>
-
-<div class="main-layout">
-
-  <div class="panel">
-    <div class="panel-header">
-      <span>Browser View (what the bot sees)</span>
-      <span id="browserLabel">no screenshot yet</span>
+  <header class="header">
+    <div class="status-dot" id="statusDot"></div>
+    <h1>Golf Bot</h1>
+    <span class="status-text" id="statusText">Loading...</span>
+    <div class="next-run">
+      <span>Next run</span>
+      <span class="next-run-value" id="nextRun">—</span>
     </div>
-    <div class="browser-view">
-      <img id="browserImg" src="/api/screenshot" style="display:none" alt="live screenshot">
-      <div class="empty-img" id="browserEmpty">
-        Bot isn't running.<br>Screenshot will appear here when the bot takes one.
+  </header>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-label">Phase</div>
+      <div class="stat-value muted" id="phase">Idle</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Saturday</div>
+      <div class="stat-value muted" id="satResult">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Sunday</div>
+      <div class="stat-value muted" id="sunResult">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Players</div>
+      <div class="stat-value muted" id="players">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Release countdown</div>
+      <div class="stat-value muted" id="countdown">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Last update</div>
+      <div class="stat-value muted" id="lastUpdate">—</div>
+    </div>
+  </div>
+
+  <div class="main-grid">
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Browser view</span>
+        <span class="card-meta" id="browserLabel">no screenshot</span>
+      </div>
+      <div class="browser-body">
+        <img id="browserImg" src="/api/screenshot" style="display:none" alt="live screenshot">
+        <div class="browser-empty" id="browserEmpty">
+          Bot isn't running. Live screenshot will appear here during a run.
+        </div>
       </div>
     </div>
-  </div>
 
-  <div class="panel">
-    <div class="panel-header">
-      <span>Live Log</span>
-      <span id="lineCount">0 lines</span>
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Run log</span>
+        <span class="card-meta" id="lineCount">0 lines</span>
+      </div>
+      <div class="log-body" id="logContent">
+        <div class="empty-state">Log is empty. Waiting for the next run.</div>
+      </div>
     </div>
-    <div class="log-content" id="logContent">
-      <div class="empty">Waiting for bot to start...</div>
+
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Run history</span>
+      <span class="card-meta" id="historyCount">0 runs</span>
+    </div>
+    <div id="historyBody">
+      <div class="empty-state">No past runs recorded yet.</div>
     </div>
   </div>
 
-</div>
-
-<div class="history-panel">
-  <div class="panel-header">
-    <span>Run History</span>
-    <span id="historyCount">0 runs</span>
-  </div>
-  <div id="historyBody">
-    <div class="history-empty">No past runs recorded yet.</div>
-  </div>
 </div>
 
 <script>
 let prevLength = 0;
-let prevScreenshotTs = 0;
 let nextRunSeconds = 0;
 
-function formatDuration(totalSeconds) {
-  if (totalSeconds < 60) return totalSeconds + 's';
-  if (totalSeconds < 3600) {
-    const m = Math.floor(totalSeconds / 60);
-    const s = totalSeconds % 60;
-    return m + 'm ' + s + 's';
-  }
-  if (totalSeconds < 86400) {
-    const h = Math.floor(totalSeconds / 3600);
-    const m = Math.floor((totalSeconds % 3600) / 60);
-    return h + 'h ' + m + 'm';
-  }
-  const d = Math.floor(totalSeconds / 86400);
-  const h = Math.floor((totalSeconds % 86400) / 3600);
-  return d + 'd ' + h + 'h';
+function formatDuration(s) {
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+  return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h';
 }
 
 function classifyLine(text) {
   const t = text.toLowerCase();
-  if (t.includes('booked!') || t.includes('verified') || t.includes('dry-run ok')) return 'highlight-book';
-  if (t.includes('failed') || t.includes('error') || t.includes('timeout') || t.includes('crash')) return 'highlight-error';
-  if (t.includes('[search]')) return 'highlight-search';
-  if (t.includes('[queue]')) return 'highlight-queue';
-  if (t.includes('[login]') || t.includes('logging in') || t.includes('login attempt')) return 'highlight-login';
-  if (t.includes('===') || t.includes('***') || t.startsWith('session')) return 'highlight-header';
-  if (t.includes('until release') || t.includes('s until release') || t.includes('sleeping')) return 'highlight-wait';
+  if (t.includes('booked!') || t.includes('verified') || t.includes('dry-run ok') || t.includes('success —')) return 'log-success';
+  if (t.includes('failed') || t.includes('error') || t.includes('timeout') || t.includes('crash')) return 'log-error';
+  if (t.includes('warn') || t.includes('retry') || t.includes('taken') || t.includes('session expired')) return 'log-warn';
+  if (t.includes('===') || t.includes('***') || t.startsWith('session')) return 'log-header';
+  if (t.includes('until release') || t.includes('sleeping') || t.includes('waiting')) return 'log-dim';
   return '';
 }
 
 function parseResults(lines) {
-  let sat = '--', sun = '--', session = '--';
-  let satClass = 'pending', sunClass = 'pending';
+  let sat = '—', sun = '—';
+  let satClass = 'muted', sunClass = 'muted';
   let isRunning = false;
-  let phase = 'Waiting to start';
-  let phaseClass = '';
-  let countdown = '--';
-  let players = '--';
+  let phase = 'Idle';
+  let phaseClass = 'muted';
+  let countdown = '—';
+  let players = '—';
 
   for (const line of lines) {
     const t = line.toLowerCase();
 
     const sessionMatch = line.match(/SESSION (\\d+)/);
-    if (sessionMatch) { session = '#' + sessionMatch[1]; isRunning = true; }
+    if (sessionMatch) { isRunning = true; }
 
     const playerMatch = line.match(/Players:\\s*(\\d+)/);
     if (playerMatch) { players = playerMatch[1]; }
-
     if (t.includes('retrying with') && t.includes('players')) {
       const fbMatch = line.match(/retrying with (\\d+) players/i);
       if (fbMatch) players = fbMatch[1] + ' (fallback)';
     }
 
-    if (t.includes('austin golf tee time')) { phase = 'Starting up'; phaseClass = ''; }
-    if (t.includes('logging in')) { phase = 'Logging in'; phaseClass = 'pending'; }
-    if (t.includes('[login] success')) { phase = 'Logged in'; phaseClass = 'booked'; }
-    if (t.includes('login failed') || t.includes('[login] failed')) { phase = 'Login failed'; phaseClass = 'failed'; }
-    if (t.includes('[queue]') && t.includes('waiting')) { phase = 'In waiting room'; phaseClass = 'pending'; }
-    if (t.includes('[queue]') && t.includes('still waiting')) { phase = 'In waiting room'; phaseClass = 'pending'; }
-    if (t.includes('[queue]') && t.includes('released')) { phase = 'Through waiting room'; phaseClass = 'booked'; }
-    if (t.includes('waiting until') && t.includes('release')) { phase = 'Waiting for 8:00 PM'; phaseClass = 'pending'; }
-    if (t.includes('release time reached')) { phase = 'Searching for tee times'; phaseClass = 'booked'; }
-    if (t.includes('already past release')) { phase = 'Searching for tee times'; phaseClass = 'booked'; }
-    if (t.includes('booking saturday')) { phase = 'Searching Saturday'; phaseClass = 'pending'; }
-    if (t.includes('booking sunday')) { phase = 'Searching Sunday'; phaseClass = 'pending'; }
-    if (t.includes('morning pass')) { phase = phase.split(' —')[0] + ' — morning'; phaseClass = 'pending'; }
-    if (t.includes('fallback pass')) { phase = phase.split(' —')[0] + ' — afternoon'; phaseClass = 'pending'; }
-    if (t.includes('[recovery]')) { phase = 'Recovering...'; phaseClass = 'failed'; }
-    if (t.includes('verified')) { phase = 'Verified booking'; phaseClass = 'booked'; }
-    if (t.includes('final results')) { phase = 'Done'; phaseClass = 'booked'; }
-    if (t.includes('max time') && t.includes('exceeded')) { phase = 'Timed out'; phaseClass = 'failed'; }
+    if (t.includes('austin golf tee time')) { phase = 'Starting'; phaseClass = ''; }
+    if (t.includes('logging in')) { phase = 'Logging in'; phaseClass = 'warning'; }
+    if (t.includes('[login] success')) { phase = 'Logged in'; phaseClass = 'success'; }
+    if (t.includes('login failed') || t.includes('[login] failed')) { phase = 'Login failed'; phaseClass = 'danger'; }
+    if (t.includes('[queue]') && (t.includes('waiting') || t.includes('still waiting'))) { phase = 'Waiting in queue'; phaseClass = 'warning'; }
+    if (t.includes('[queue]') && t.includes('released')) { phase = 'Through queue'; phaseClass = 'success'; }
+    if (t.includes('waiting until') && t.includes('release')) { phase = 'Waiting for release'; phaseClass = 'warning'; }
+    if (t.includes('release time reached')) { phase = 'Searching'; phaseClass = ''; }
+    if (t.includes('already past release')) { phase = 'Searching'; phaseClass = ''; }
+    if (t.includes('booking saturday')) { phase = 'Searching Saturday'; phaseClass = ''; }
+    if (t.includes('booking sunday')) { phase = 'Searching Sunday'; phaseClass = ''; }
+    if (t.includes('morning pass')) { phase = phase.split(' —')[0] + ' (morning)'; }
+    if (t.includes('fallback pass')) { phase = phase.split(' —')[0] + ' (afternoon)'; }
+    if (t.includes('[recovery]')) { phase = 'Recovering'; phaseClass = 'danger'; }
+    if (t.includes('verified')) { phase = 'Booking verified'; phaseClass = 'success'; }
+    if (t.includes('final results')) { phase = 'Done'; phaseClass = 'success'; }
+    if (t.includes('max time') && t.includes('exceeded')) { phase = 'Timed out'; phaseClass = 'danger'; }
 
     const countdownMatch = line.match(/(\\d+)s until release/);
     if (countdownMatch) {
       const secs = parseInt(countdownMatch[1]);
-      const m = Math.floor(secs / 60);
-      const s = secs % 60;
-      countdown = m + ':' + String(s).padStart(2, '0');
+      countdown = Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0');
     }
-    if (t.includes('release time reached') || t.includes('already past release')) { countdown = 'GO!'; }
+    if (t.includes('release time reached') || t.includes('already past release')) { countdown = 'Live'; }
 
     if (t.includes('saturday') && t.includes('success')) {
       const detail = line.match(/SUCCESS.*?[—-]\\s*(.+)/);
-      sat = detail ? detail[1].trim() : 'Booked'; satClass = 'booked';
+      sat = detail ? detail[1].trim() : 'Booked'; satClass = 'success';
     }
     if (t.includes('sunday') && t.includes('success')) {
       const detail = line.match(/SUCCESS.*?[—-]\\s*(.+)/);
-      sun = detail ? detail[1].trim() : 'Booked'; sunClass = 'booked';
+      sun = detail ? detail[1].trim() : 'Booked'; sunClass = 'success';
     }
-    if (t.includes('saturday') && t.includes('no booking')) { sat = 'No booking'; satClass = 'failed'; }
-    if (t.includes('sunday') && t.includes('no booking')) { sun = 'No booking'; sunClass = 'failed'; }
+    if (t.includes('saturday') && t.includes('no booking')) { sat = 'No booking'; satClass = 'danger'; }
+    if (t.includes('sunday') && t.includes('no booking')) { sun = 'No booking'; sunClass = 'danger'; }
 
-    if (t.includes('booking saturday') && sat === '--') { sat = 'Searching...'; satClass = 'pending'; }
-    if (t.includes('booking sunday') && sun === '--') { sun = 'Searching...'; sunClass = 'pending'; }
-
-    if (t.includes('verified')) {
-      const v = line.match(/VERIFIED/i);
-      if (v && phase.toLowerCase().includes('sunday')) { sun = (sun.replace(' ✓','')) + ' ✓'; sunClass = 'booked'; }
-      else if (v) { sat = (sat.replace(' ✓','')) + ' ✓'; satClass = 'booked'; }
-    }
+    if (t.includes('booking saturday') && sat === '—') { sat = 'Searching…'; satClass = 'warning'; }
+    if (t.includes('booking sunday') && sun === '—') { sun = 'Searching…'; sunClass = 'warning'; }
   }
 
-  return { sat, sun, satClass, sunClass, session, isRunning, phase, phaseClass, countdown, players };
+  return { sat, sun, satClass, sunClass, isRunning, phase, phaseClass, countdown, players };
 }
 
 async function refreshLog() {
@@ -334,7 +417,7 @@ async function refreshLog() {
     const data = await resp.json();
     const lines = data.lines;
 
-    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
 
     if (lines.length === 0) return;
 
@@ -350,40 +433,39 @@ async function refreshLog() {
       document.getElementById('lineCount').textContent = lines.length + ' lines';
 
       const r = parseResults(lines);
-      const satEl = document.getElementById('satResult');
-      const sunEl = document.getElementById('sunResult');
-      satEl.textContent = r.sat; satEl.className = 'card-value ' + r.satClass;
-      sunEl.textContent = r.sun; sunEl.className = 'card-value ' + r.sunClass;
-
-      const phaseEl = document.getElementById('phase');
-      phaseEl.textContent = r.phase;
-      phaseEl.className = 'card-value ' + (r.phaseClass || '');
-
-      document.getElementById('players').textContent = r.players;
-      document.getElementById('countdown').textContent = r.countdown;
+      setStat('satResult', r.sat, r.satClass);
+      setStat('sunResult', r.sun, r.sunClass);
+      setStat('phase', r.phase, r.phaseClass);
+      setStat('players', r.players, r.players === '—' ? 'muted' : '');
+      setStat('countdown', r.countdown, r.countdown === '—' ? 'muted' : '');
 
       const dot = document.getElementById('statusDot');
       const statusText = document.getElementById('statusText');
-
       if (r.phase === 'Done') {
-        const allBooked = r.satClass === 'booked' && r.sunClass === 'booked';
+        const allBooked = r.satClass === 'success' && r.sunClass === 'success';
         dot.className = 'status-dot ' + (allBooked ? 'success' : 'failed');
-        statusText.textContent = allBooked ? 'Both days booked!' : 'Finished';
+        statusText.textContent = allBooked ? 'Both days booked' : 'Finished';
       } else if (r.phase === 'Timed out') {
         dot.className = 'status-dot failed';
         statusText.textContent = 'Timed out';
-      } else if (r.phase === 'In waiting room') {
+      } else if (r.phase === 'Waiting in queue') {
         dot.className = 'status-dot active';
-        statusText.textContent = 'In Queue-it waiting room...';
-      } else if (r.phase.includes('Waiting for 8')) {
+        statusText.textContent = 'In waiting room';
+      } else if (r.phase.includes('Waiting')) {
         dot.className = 'status-dot active';
-        statusText.textContent = 'Waiting for tee time release...';
+        statusText.textContent = 'Waiting';
       } else if (r.isRunning) {
         dot.className = 'status-dot active';
-        statusText.textContent = 'Bot is running...';
+        statusText.textContent = 'Running';
       }
     }
   } catch (e) {}
+}
+
+function setStat(id, text, cls) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'stat-value ' + (cls || '');
 }
 
 async function refreshScreenshot() {
@@ -398,11 +480,11 @@ async function refreshScreenshot() {
       img.src = '/api/screenshot?t=' + info.mtime;
       img.style.display = 'block';
       empty.style.display = 'none';
-      label.textContent = info.label || ('updated ' + new Date(info.mtime * 1000).toLocaleTimeString());
+      label.textContent = info.label || new Date(info.mtime * 1000).toLocaleTimeString();
     } else {
       img.style.display = 'none';
       empty.style.display = 'flex';
-      label.textContent = 'no screenshot yet';
+      label.textContent = 'no screenshot';
     }
   } catch (e) {}
 }
@@ -416,121 +498,110 @@ async function refreshNextRun() {
   } catch (e) {}
 }
 
+function tickNextRun() {
+  if (nextRunSeconds > 0) nextRunSeconds -= 1;
+  const el = document.getElementById('nextRun');
+  el.textContent = nextRunSeconds <= 0 ? 'now' : formatDuration(nextRunSeconds);
+}
+
 function formatTimestamp(iso) {
-  if (!iso) return '--';
+  if (!iso) return '—';
   try {
     const d = new Date(iso);
-    return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    const dateStr = d.toLocaleDateString([], {month: 'short', day: 'numeric'});
+    const timeStr = d.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+    return dateStr + ', ' + timeStr;
   } catch (e) { return iso; }
 }
 
-function formatDurationFromRun(started, ended) {
-  if (!started || !ended) return '--';
+function runDuration(started, ended) {
+  if (!started || !ended) return '—';
   try {
     const sec = Math.max(0, Math.round((new Date(ended) - new Date(started)) / 1000));
-    if (sec < 60) return sec + 's';
-    const m = Math.floor(sec / 60);
-    const s = sec % 60;
-    return m + 'm ' + s + 's';
-  } catch (e) { return '--'; }
+    return formatDuration(sec);
+  } catch (e) { return '—'; }
 }
 
 function renderHistory(entries) {
   const body = document.getElementById('historyBody');
   const count = document.getElementById('historyCount');
-  count.textContent = entries.length + ' run' + (entries.length === 1 ? '' : 's');
+  count.textContent = entries.length + (entries.length === 1 ? ' run' : ' runs');
 
   if (!entries.length) {
-    body.innerHTML = '<div class="history-empty">No past runs recorded yet.</div>';
+    body.innerHTML = '<div class="empty-state">No past runs recorded yet.</div>';
     return;
   }
 
-  let html = '<table class="history-table">';
-  html += '<thead><tr>';
-  html += '<th>When</th><th>Weekend</th><th>Saturday</th><th>Sunday</th><th>Duration</th>';
+  let html = '<table class="history-table"><thead><tr>';
+  html += '<th style="width:140px">Run date</th>';
+  html += '<th style="width:110px">Status</th>';
+  html += '<th>Saturday</th>';
+  html += '<th>Sunday</th>';
+  html += '<th style="width:100px">Duration</th>';
   html += '</tr></thead><tbody>';
 
   for (const e of entries) {
     const sat = e.results?.saturday;
     const sun = e.results?.sunday;
-    const satText = sat?.success ? sat.details : 'No booking';
-    const sunText = sun?.success ? sun.details : 'No booking';
-    const satClass = sat?.success ? 'history-booked' : 'history-failed';
-    const sunClass = sun?.success ? 'history-booked' : 'history-failed';
+    const satOk = !!sat?.success;
+    const sunOk = !!sun?.success;
+    const satText = satOk ? sat.details : 'No booking';
+    const sunText = sunOk ? sun.details : 'No booking';
+
+    let overall, overallClass;
+    if (satOk && sunOk) { overall = 'Success'; overallClass = 'success'; }
+    else if (satOk || sunOk) { overall = 'Partial'; overallClass = 'warning'; }
+    else { overall = 'Failed'; overallClass = 'danger'; }
 
     html += '<tr>';
-    html += '<td>' + escapeHtml(formatTimestamp(e.run_started)) + '</td>';
-    html += '<td>' + escapeHtml(e.weekend || '--') + '</td>';
-    html += '<td class="' + satClass + '">' + escapeHtml(satText) + '</td>';
-    html += '<td class="' + sunClass + '">' + escapeHtml(sunText) + '</td>';
-    html += '<td>' + escapeHtml(formatDurationFromRun(e.run_started, e.run_ended)) + '</td>';
+    html += '<td class="muted">' + escapeHtml(formatTimestamp(e.run_started)) + '</td>';
+    html += '<td><span class="badge ' + overallClass + '"><span class="badge-dot"></span>' + overall + '</span></td>';
+    html += '<td>' + renderBookingCell(satText, satOk) + '</td>';
+    html += '<td>' + renderBookingCell(sunText, sunOk) + '</td>';
+    html += '<td class="muted">' + escapeHtml(runDuration(e.run_started, e.run_ended)) + '</td>';
     html += '</tr>';
   }
   html += '</tbody></table>';
   body.innerHTML = html;
 }
 
-let latestHistoryEntry = null;
+function renderBookingCell(text, ok) {
+  const cls = ok ? 'success' : 'danger';
+  const icon = ok ? '✓' : '✗';
+  return '<span style="color: var(--' + cls + ')">' + icon + '</span> ' + escapeHtml(text);
+}
 
 async function refreshHistory() {
   try {
     const resp = await fetch('/api/history');
     const entries = await resp.json();
-    latestHistoryEntry = entries[0] || null;
     renderHistory(entries);
-
-    // If there's no active bot run, show the most recent booking from history
-    // in the status cards so the dashboard isn't stuck on stale log data.
-    if (latestHistoryEntry && prevLength === 0) {
-      applyHistoryToStatusCards(latestHistoryEntry);
-    }
+    if (entries[0] && prevLength === 0) applyHistoryToStatus(entries[0]);
   } catch (e) {}
 }
 
-function applyHistoryToStatusCards(entry) {
+function applyHistoryToStatus(entry) {
   const sat = entry.results?.saturday;
   const sun = entry.results?.sunday;
-  const satEl = document.getElementById('satResult');
-  const sunEl = document.getElementById('sunResult');
-  if (sat?.success) {
-    satEl.textContent = sat.details; satEl.className = 'card-value booked';
-  } else {
-    satEl.textContent = 'No booking'; satEl.className = 'card-value failed';
-  }
-  if (sun?.success) {
-    sunEl.textContent = sun.details; sunEl.className = 'card-value booked';
-  } else {
-    sunEl.textContent = 'No booking'; sunEl.className = 'card-value failed';
-  }
-  const phaseEl = document.getElementById('phase');
-  phaseEl.textContent = 'Idle — last run: ' + formatTimestamp(entry.run_started);
-  phaseEl.className = 'card-value';
+  setStat('satResult', sat?.success ? sat.details : 'No booking', sat?.success ? 'success' : 'danger');
+  setStat('sunResult', sun?.success ? sun.details : 'No booking', sun?.success ? 'success' : 'danger');
+  setStat('phase', 'Idle — last ran ' + formatTimestamp(entry.run_started), '');
 
   const dot = document.getElementById('statusDot');
   const statusText = document.getElementById('statusText');
   const allBooked = sat?.success && sun?.success;
   dot.className = 'status-dot ' + (allBooked ? 'success' : 'failed');
-  statusText.textContent = allBooked ? 'Last run: both days booked' : 'Last run: incomplete';
-}
-
-function tickNextRun() {
-  if (nextRunSeconds > 0) nextRunSeconds -= 1;
-  const el = document.getElementById('nextRun');
-  if (nextRunSeconds <= 0) {
-    el.textContent = 'Next run: now!';
-  } else {
-    el.textContent = 'Next run in ' + formatDuration(nextRunSeconds);
-  }
+  statusText.textContent = allBooked ? 'Last run: both booked' : 'Last run: incomplete';
 }
 
 function escapeHtml(t) {
-  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g, '&quot;');
 }
 
 setInterval(refreshLog, 1000);
 setInterval(refreshScreenshot, 2000);
 setInterval(tickNextRun, 1000);
-setInterval(refreshNextRun, 60000);  // resync each minute
+setInterval(refreshNextRun, 60000);
 setInterval(refreshHistory, 10000);
 refreshLog();
 refreshScreenshot();
@@ -612,12 +683,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(obj).encode())
 
     def log_message(self, format, *args):
-        pass  # suppress request logs
+        pass
 
 
 if __name__ == "__main__":
     print(f"Golf Bot Monitor running at http://localhost:{PORT}")
-    print("Open this URL in your browser to watch the bot in real time.")
+    print("Open this URL in your browser to watch the bot.")
     print("Press Ctrl+C to stop.\n")
     server = http.server.HTTPServer(("", PORT), Handler)
     try:
