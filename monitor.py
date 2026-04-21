@@ -15,6 +15,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(SCRIPT_DIR, "booking.log")
 LIVE_SCREENSHOT = os.path.join(SCRIPT_DIR, "debug_screenshots", "live.png")
 LIVE_LABEL = os.path.join(SCRIPT_DIR, "debug_screenshots", "live_label.txt")
+HISTORY_FILE = os.path.join(SCRIPT_DIR, "history.json")
 PORT = 8111
 
 
@@ -120,6 +121,29 @@ HTML = """<!DOCTYPE html>
   .line.highlight-header { color: #f0f6fc; font-weight: 600; }
   .line.highlight-wait { color: #8b949e; }
   .empty { color: #484f58; font-style: italic; padding: 40px; text-align: center; }
+  .history-panel {
+    margin-top: 20px;
+    background: #0d1117; border: 1px solid #30363d; border-radius: 12px;
+    overflow: hidden;
+  }
+  .history-table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+  }
+  .history-table th {
+    text-align: left; padding: 10px 16px; background: #161b22;
+    color: #8b949e; font-weight: 500; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 1px;
+    border-bottom: 1px solid #30363d;
+  }
+  .history-table td {
+    padding: 12px 16px; border-bottom: 1px solid #21262d; color: #c9d1d9;
+  }
+  .history-table tr:last-child td { border-bottom: none; }
+  .history-table tr:hover td { background: #161b22; }
+  .history-booked { color: #3fb950; }
+  .history-failed { color: #f85149; }
+  .history-partial { color: #d29922; }
+  .history-empty { padding: 30px; color: #484f58; font-style: italic; text-align: center; }
 </style>
 </head>
 <body>
@@ -183,6 +207,16 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+</div>
+
+<div class="history-panel">
+  <div class="panel-header">
+    <span>Run History</span>
+    <span id="historyCount">0 runs</span>
+  </div>
+  <div id="historyBody">
+    <div class="history-empty">No past runs recorded yet.</div>
+  </div>
 </div>
 
 <script>
@@ -382,6 +416,103 @@ async function refreshNextRun() {
   } catch (e) {}
 }
 
+function formatTimestamp(iso) {
+  if (!iso) return '--';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+  } catch (e) { return iso; }
+}
+
+function formatDurationFromRun(started, ended) {
+  if (!started || !ended) return '--';
+  try {
+    const sec = Math.max(0, Math.round((new Date(ended) - new Date(started)) / 1000));
+    if (sec < 60) return sec + 's';
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return m + 'm ' + s + 's';
+  } catch (e) { return '--'; }
+}
+
+function renderHistory(entries) {
+  const body = document.getElementById('historyBody');
+  const count = document.getElementById('historyCount');
+  count.textContent = entries.length + ' run' + (entries.length === 1 ? '' : 's');
+
+  if (!entries.length) {
+    body.innerHTML = '<div class="history-empty">No past runs recorded yet.</div>';
+    return;
+  }
+
+  let html = '<table class="history-table">';
+  html += '<thead><tr>';
+  html += '<th>When</th><th>Weekend</th><th>Saturday</th><th>Sunday</th><th>Duration</th>';
+  html += '</tr></thead><tbody>';
+
+  for (const e of entries) {
+    const sat = e.results?.saturday;
+    const sun = e.results?.sunday;
+    const satText = sat?.success ? sat.details : 'No booking';
+    const sunText = sun?.success ? sun.details : 'No booking';
+    const satClass = sat?.success ? 'history-booked' : 'history-failed';
+    const sunClass = sun?.success ? 'history-booked' : 'history-failed';
+
+    html += '<tr>';
+    html += '<td>' + escapeHtml(formatTimestamp(e.run_started)) + '</td>';
+    html += '<td>' + escapeHtml(e.weekend || '--') + '</td>';
+    html += '<td class="' + satClass + '">' + escapeHtml(satText) + '</td>';
+    html += '<td class="' + sunClass + '">' + escapeHtml(sunText) + '</td>';
+    html += '<td>' + escapeHtml(formatDurationFromRun(e.run_started, e.run_ended)) + '</td>';
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  body.innerHTML = html;
+}
+
+let latestHistoryEntry = null;
+
+async function refreshHistory() {
+  try {
+    const resp = await fetch('/api/history');
+    const entries = await resp.json();
+    latestHistoryEntry = entries[0] || null;
+    renderHistory(entries);
+
+    // If there's no active bot run, show the most recent booking from history
+    // in the status cards so the dashboard isn't stuck on stale log data.
+    if (latestHistoryEntry && prevLength === 0) {
+      applyHistoryToStatusCards(latestHistoryEntry);
+    }
+  } catch (e) {}
+}
+
+function applyHistoryToStatusCards(entry) {
+  const sat = entry.results?.saturday;
+  const sun = entry.results?.sunday;
+  const satEl = document.getElementById('satResult');
+  const sunEl = document.getElementById('sunResult');
+  if (sat?.success) {
+    satEl.textContent = sat.details; satEl.className = 'card-value booked';
+  } else {
+    satEl.textContent = 'No booking'; satEl.className = 'card-value failed';
+  }
+  if (sun?.success) {
+    sunEl.textContent = sun.details; sunEl.className = 'card-value booked';
+  } else {
+    sunEl.textContent = 'No booking'; sunEl.className = 'card-value failed';
+  }
+  const phaseEl = document.getElementById('phase');
+  phaseEl.textContent = 'Idle — last run: ' + formatTimestamp(entry.run_started);
+  phaseEl.className = 'card-value';
+
+  const dot = document.getElementById('statusDot');
+  const statusText = document.getElementById('statusText');
+  const allBooked = sat?.success && sun?.success;
+  dot.className = 'status-dot ' + (allBooked ? 'success' : 'failed');
+  statusText.textContent = allBooked ? 'Last run: both days booked' : 'Last run: incomplete';
+}
+
 function tickNextRun() {
   if (nextRunSeconds > 0) nextRunSeconds -= 1;
   const el = document.getElementById('nextRun');
@@ -400,9 +531,11 @@ setInterval(refreshLog, 1000);
 setInterval(refreshScreenshot, 2000);
 setInterval(tickNextRun, 1000);
 setInterval(refreshNextRun, 60000);  // resync each minute
+setInterval(refreshHistory, 10000);
 refreshLog();
 refreshScreenshot();
 refreshNextRun();
+refreshHistory();
 </script>
 </body>
 </html>"""
@@ -452,6 +585,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif path == "/api/next_run":
             self._json({"seconds": seconds_until_next_monday_745pm()})
+
+        elif path == "/api/history":
+            try:
+                with open(HISTORY_FILE, "r") as f:
+                    entries = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                entries = []
+            self._json(entries)
 
         elif path in ("/", ""):
             self.send_response(200)

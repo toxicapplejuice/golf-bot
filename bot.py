@@ -33,6 +33,8 @@ except ImportError:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_screenshots")
 STATE_FILE = os.path.join(SCRIPT_DIR, "state.json")
+HISTORY_FILE = os.path.join(SCRIPT_DIR, "history.json")
+HISTORY_MAX_ENTRIES = 50
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
 from config import (
@@ -292,6 +294,46 @@ def clear_state() -> None:
             os.remove(STATE_FILE)
     except Exception:
         pass
+
+
+# ======================================================================
+# Historical run log (for dashboard history panel)
+# ======================================================================
+
+def _load_history() -> list:
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def append_to_history(saturday_date: str, sunday_date: str, results: dict,
+                       run_started: str, run_ended: str,
+                       notes: str = None) -> None:
+    """Record a completed run in history.json. Newest entries first.
+
+    Keeps last HISTORY_MAX_ENTRIES runs so the file doesn't grow forever.
+    Dashboard displays this as a "past runs" panel.
+    """
+    history = _load_history()
+    entry = {
+        "run_started": run_started,
+        "run_ended": run_ended,
+        "weekend": f"{saturday_date} - {sunday_date}",
+        "saturday_date": saturday_date,
+        "sunday_date": sunday_date,
+        "results": results,
+    }
+    if notes:
+        entry["notes"] = notes
+    history.insert(0, entry)
+    history = history[:HISTORY_MAX_ENTRIES]
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        print(f"  [history] Save failed: {e}")
 
 
 # ======================================================================
@@ -1138,6 +1180,7 @@ def run_booking(args) -> dict:
           f"Dry run: {args.dry_run} | Headful: {args.headful}")
 
     start_time = time.time()
+    run_started_iso = datetime.now().isoformat(timespec="seconds")
     session_count = 0
 
     # Watchdog — urgent notification if the bot appears stuck
@@ -1240,6 +1283,13 @@ def run_booking(args) -> dict:
     # Clear state if fully successful — fresh start next week
     if both_booked:
         clear_state()
+
+    # Record the run in history for the dashboard's past-runs view
+    append_to_history(
+        saturday_date, sunday_date, results,
+        run_started=run_started_iso,
+        run_ended=datetime.now().isoformat(timespec="seconds"),
+    )
 
     clear_live_screenshot()
     return results

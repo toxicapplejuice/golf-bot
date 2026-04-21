@@ -9,3 +9,4 @@ booking.log
 .pytest_cache/
 
 state.json
+history.json
