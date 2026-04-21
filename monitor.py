@@ -37,7 +37,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Golf Bot</title>
+<title>Austin Municipal Tee Time Bot</title>
 <style>
   :root {
     --bg: #09090b;
@@ -251,7 +251,7 @@ HTML = """<!DOCTYPE html>
 
   <header class="header">
     <div class="status-dot" id="statusDot"></div>
-    <h1>Golf Bot</h1>
+    <h1>Austin Municipal Tee Time Bot</h1>
     <span class="status-text" id="statusText">Loading...</span>
     <div class="next-run">
       <span>Next run</span>
