@@ -1118,21 +1118,27 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
             if verify_booking_via_history(page, slot):
                 print("VERIFIED ✓")
                 details = f"{slot['time']} at {course_name}"
-                # Multi-account coordination: claim this day so other accounts stop.
+                # Multi-account coordination: append to shared bookings list.
+                # claim_booking allows up to MAX_BOOKINGS_PER_DAY total per day
+                # (and rejects same-account duplicates).
                 if weekend and day_name:
                     claimed, cur_state = shared_state.claim_booking(
                         weekend, day_name, details, ACCOUNT_ID,
                     )
                     if not claimed:
-                        # Another account beat us by milliseconds — they already booked.
-                        # We successfully booked a duplicate. Warn the user to cancel.
-                        winner = (cur_state.get(day_name) or {}).get("booked_by", "?")
-                        print(f"    [coord] WARNING: '{winner}' already claimed {day_name}. "
-                              f"This is a duplicate booking — cancel manually.")
+                        # Day was already at MAX bookings when we tried to claim,
+                        # OR this account already booked this day (shouldn't happen
+                        # in normal flow). Either way our just-booked slot is a
+                        # duplicate to cancel.
+                        existing = (cur_state.get(day_name) or {}).get("bookings", [])
+                        existing_names = ", ".join(b.get("booked_by", "?") for b in existing)
+                        print(f"    [coord] WARNING: {day_name} already has "
+                              f"{len(existing)} bookings ({existing_names}). "
+                              f"This is a duplicate — cancel manually.")
                         send_ntfy(
                             f"[{ACCOUNT_DISPLAY_NAME}] DUPLICATE booking on {day_name}",
-                            f"Both this account and '{winner}' booked {day_name}. "
-                            f"Cancel one manually. Mine: {details}",
+                            f"{day_name.capitalize()} already booked by: {existing_names}. "
+                            f"Mine ({details}) is extra — cancel manually.",
                             priority="urgent", tags="warning",
                         )
                 return {
@@ -1188,11 +1194,16 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
     (e.g. "4/25/2026 - 4/26/2026"). If another account already booked this day
     via shared_state, we short-circuit with skipped=True.
     """
-    # Multi-account coordination: skip if another account already booked this day
+    # Multi-account coordination: skip if this day has already hit MAX bookings
+    # across all accounts. Each account books at most one slot/day, so we check
+    # both "did this account already book" and "is the day at capacity."
     if weekend:
-        already, booked_by = shared_state.day_already_booked(weekend, day_name)
-        if already:
-            print(f"\n  === {day_name.upper()} already booked by '{booked_by}' — skipping ===")
+        is_full, booked_by_list = shared_state.day_already_booked(weekend, day_name)
+        if ACCOUNT_ID in booked_by_list:
+            print(f"\n  === {day_name.upper()} already booked by THIS account — skipping ===")
+            return {"success": False, "details": None, "course": None, "skipped": True}
+        if is_full:
+            print(f"\n  === {day_name.upper()} already at capacity ({', '.join(booked_by_list)}) — skipping ===")
             return {"success": False, "details": None, "course": None, "skipped": True}
 
     passes = [("morning", MAX_HOUR), ("fallback", FALLBACK_MAX_HOUR)]
@@ -1201,12 +1212,14 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
         print(f"\n  === {day_name.upper()} / {pass_label} pass (until {max_hour}:00) ===")
         for round_num in range(1, MAX_SEARCH_ROUNDS_PER_PASS + 1):
             print(f"  Round {round_num}/{MAX_SEARCH_ROUNDS_PER_PASS}")
-            # Poll shared state between rounds too — another account may have won
-            # while we were searching courses on this one.
+            # Poll shared state between rounds too — sibling accounts may have
+            # filled the day to capacity while we were searching this course.
             if weekend:
-                already, booked_by = shared_state.day_already_booked(weekend, day_name)
-                if already:
-                    print(f"  [coord] {day_name} was just booked by '{booked_by}' mid-search — stopping")
+                is_full, booked_by_list = shared_state.day_already_booked(weekend, day_name)
+                if ACCOUNT_ID in booked_by_list:
+                    return {"success": False, "details": None, "course": None, "skipped": True}
+                if is_full:
+                    print(f"  [coord] {day_name} hit capacity ({', '.join(booked_by_list)}) — stopping")
                     return {"success": False, "details": None, "course": None, "skipped": True}
             for course_code, course_name in COURSE_CODES.items():
                 if exclude_course and course_name == exclude_course:

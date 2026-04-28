@@ -46,6 +46,12 @@ NUM_PLAYERS = 4
 # Set to None to disable the fallback.
 FALLBACK_NUM_PLAYERS = 2
 
+# How many tee times to book per day across all accounts (in multi-account mode).
+# Each account books at most ONE slot per day; this caps the total per-day booking
+# count across the racing accounts. Default 2 = e.g. two adjacent 4-player slots
+# at the same course so a group of 8 can play back-to-back.
+MAX_BOOKINGS_PER_DAY = 2
+
 # Booking window (8am-1pm preferred)
 MIN_HOUR = 8   # 8 AM
 MAX_HOUR = 13  # 1 PM (inclusive)

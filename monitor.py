@@ -451,39 +451,44 @@ async function refreshSharedState() {
     const state = await resp.json();
     const sat = state.saturday || {};
     const sun = state.sunday || {};
+    const satBookings = sat.bookings || [];
+    const sunBookings = sun.bookings || [];
+    const MAX = 2;  // matches MAX_BOOKINGS_PER_DAY in config.py
 
     const satEl = document.getElementById('sharedSat');
     const satByEl = document.getElementById('sharedSatBy');
     const sunEl = document.getElementById('sharedSun');
     const sunByEl = document.getElementById('sharedSunBy');
 
-    if (sat.booked_by) {
-      satEl.textContent = sat.details || 'Booked';
-      satEl.className = 'shared-value booked';
-      satByEl.textContent = 'booked by ' + sat.booked_by;
-    } else {
-      satEl.textContent = 'Not booked';
-      satEl.className = 'shared-value pending';
-      satByEl.textContent = '';
+    function fmtDay(bookings) {
+      if (!bookings.length) return {value: 'Not booked', cls: 'pending', detail: ''};
+      const lines = bookings.map(b => `${b.details} (${b.booked_by})`);
+      return {
+        value: `${bookings.length}/${MAX} booked`,
+        cls: bookings.length >= MAX ? 'booked' : 'pending',
+        detail: lines.join(' · '),
+      };
     }
-    if (sun.booked_by) {
-      sunEl.textContent = sun.details || 'Booked';
-      sunEl.className = 'shared-value booked';
-      sunByEl.textContent = 'booked by ' + sun.booked_by;
-    } else {
-      sunEl.textContent = 'Not booked';
-      sunEl.className = 'shared-value pending';
-      sunByEl.textContent = '';
-    }
+    const s = fmtDay(satBookings);
+    satEl.textContent = s.value;
+    satEl.className = 'shared-value ' + s.cls;
+    satByEl.textContent = s.detail;
+
+    const u = fmtDay(sunBookings);
+    sunEl.textContent = u.value;
+    sunEl.className = 'shared-value ' + u.cls;
+    sunByEl.textContent = u.detail;
 
     const dot = document.getElementById('statusDot');
     const text = document.getElementById('statusText');
-    if (sat.booked_by && sun.booked_by) {
+    const totalBooked = satBookings.length + sunBookings.length;
+    const totalTarget = 2 * MAX;
+    if (satBookings.length >= MAX && sunBookings.length >= MAX) {
       dot.className = 'status-dot success';
-      text.textContent = 'Both days booked';
-    } else if (sat.booked_by || sun.booked_by) {
+      text.textContent = `All ${totalTarget} tee times booked`;
+    } else if (totalBooked > 0) {
       dot.className = 'status-dot active';
-      text.textContent = 'Partial — still searching';
+      text.textContent = `${totalBooked}/${totalTarget} booked — still racing`;
     } else {
       dot.className = 'status-dot';
       text.textContent = 'Idle';

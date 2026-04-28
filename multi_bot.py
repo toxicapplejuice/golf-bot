@@ -179,35 +179,44 @@ def main() -> int:
     final_state = shared_state.read_shared(weekend)
     sat = final_state.get("saturday") or {}
     sun = final_state.get("sunday") or {}
+    sat_bookings = sat.get("bookings", []) or []
+    sun_bookings = sun.get("bookings", []) or []
+    MAX = shared_state.MAX_BOOKINGS_PER_DAY
+
+    def fmt_bookings(bs):
+        if not bs:
+            return "NO BOOKINGS"
+        return "; ".join(f"{b['details']} ({b['booked_by']})" for b in bs)
 
     print("\n" + "=" * 60)
     print("MULTI-BOT FINAL RESULTS:")
-    if sat.get("booked_by"):
-        print(f"  Saturday: {sat['details']} (booked by {sat['booked_by']})")
-    else:
-        print(f"  Saturday: NO BOOKING")
-    if sun.get("booked_by"):
-        print(f"  Sunday: {sun['details']} (booked by {sun['booked_by']})")
-    else:
-        print(f"  Sunday: NO BOOKING")
+    print(f"  Saturday ({len(sat_bookings)}/{MAX}): {fmt_bookings(sat_bookings)}")
+    print(f"  Sunday ({len(sun_bookings)}/{MAX}): {fmt_bookings(sun_bookings)}")
     print("=" * 60)
 
-    # Build a unified history entry (one per orchestrator run, not per account)
+    # Build a unified history entry (one per orchestrator run, not per account).
+    # Keep "success" semantically = "we got at least one booking that day", and
+    # surface the full bookings list for richer dashboards.
     aggregate_results = {
         "saturday": {
-            "success": bool(sat.get("booked_by")),
-            "details": sat.get("details"),
+            "success": len(sat_bookings) > 0,
+            "details": fmt_bookings(sat_bookings) if sat_bookings else None,
             "course": None,
-            "booked_by": sat.get("booked_by"),
+            "booked_by": sat_bookings[0]["booked_by"] if sat_bookings else None,
+            "bookings": sat_bookings,
+            "count": len(sat_bookings),
+            "max": MAX,
         },
         "sunday": {
-            "success": bool(sun.get("booked_by")),
-            "details": sun.get("details"),
+            "success": len(sun_bookings) > 0,
+            "details": fmt_bookings(sun_bookings) if sun_bookings else None,
             "course": None,
-            "booked_by": sun.get("booked_by"),
+            "booked_by": sun_bookings[0]["booked_by"] if sun_bookings else None,
+            "bookings": sun_bookings,
+            "count": len(sun_bookings),
+            "max": MAX,
         },
     }
-    # Use a special "multi" account id for the aggregate history row
     bot.ACCOUNT_ID = "multi"
     bot.ACCOUNT_DISPLAY_NAME = "Multi-bot"
     bot.append_to_history(
@@ -217,21 +226,19 @@ def main() -> int:
         notes=f"Accounts: {', '.join(a['display_name'] for a in accounts)}",
     )
 
-    # Aggregated summary notification
-    sat_booked = bool(sat.get("booked_by"))
-    sun_booked = bool(sun.get("booked_by"))
-    body = []
-    body.append(f"Saturday: {sat['details']} (won by {sat['booked_by']})" if sat_booked
-                else "Saturday: NO BOOKING")
-    body.append(f"Sunday: {sun['details']} (won by {sun['booked_by']})" if sun_booked
-                else "Sunday: NO BOOKING")
+    total_booked = len(sat_bookings) + len(sun_bookings)
+    target = 2 * MAX
+    body = [
+        f"Saturday ({len(sat_bookings)}/{MAX}): {fmt_bookings(sat_bookings)}",
+        f"Sunday ({len(sun_bookings)}/{MAX}): {fmt_bookings(sun_bookings)}",
+    ]
 
-    if sat_booked and sun_booked:
-        title = "Both days booked!"
+    if total_booked >= target:
+        title = f"All {target} tee times booked!"
         priority = "default"
         tags = "golf,white_check_mark"
-    elif sat_booked or sun_booked:
-        title = "Partial success"
+    elif total_booked > 0:
+        title = f"Partial: {total_booked}/{target} booked"
         priority = "high"
         tags = "golf,warning"
     else:
