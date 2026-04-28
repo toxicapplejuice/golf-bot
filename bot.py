@@ -373,9 +373,18 @@ def load_state(saturday_date: str, sunday_date: str) -> dict:
     if state.get("results"):
         sat = state["results"].get("saturday", {})
         sun = state["results"].get("sunday", {})
-        if sat.get("success") or sun.get("success"):
-            print(f"  [state] Resuming: Sat={sat.get('details') or 'pending'}, "
-                  f"Sun={sun.get('details') or 'pending'}")
+        # Resume if either day was booked OR halted for manual review (so we
+        # don't re-attempt a day where we may have already committed a booking).
+        has_progress = (sat.get("success") or sun.get("success")
+                        or sat.get("halt_day") or sun.get("halt_day"))
+        if has_progress:
+            def _label(d):
+                if d.get("success"):
+                    return d.get("details") or "booked"
+                if d.get("halt_day"):
+                    return "halted (manual check)"
+                return "pending"
+            print(f"  [state] Resuming: Sat={_label(sat)}, Sun={_label(sun)}")
             return state["results"]
     return empty
 
@@ -892,13 +901,35 @@ HISTORY_URL = f"{BASE_URL}/history.html?historyoption=inquiry"
 
 
 def verify_booking_on_page(page, slot: dict, page_text: str) -> bool:
-    """Quick first-pass verification: does the current page reference our slot?"""
-    time_lower = slot["time"].lower().replace(" ", "")
+    """Quick first-pass verification: does the current page reference our slot?
+
+    NOTE: As of 2026-04-27, Vermont Systems' Checkout Confirmation page does
+    NOT include the slot time/course/date — it only shows a receipt number
+    and emails the details. So this check returns False on real receipts in
+    practice, and the URL-marker fallback in attempt_booking_click() (plus
+    verify_booking_via_history) is what actually decides "booked." This
+    function is kept as a defense in case the confirmation page ever starts
+    showing slot details again.
+
+    Time-format handling mirrors verify_booking_via_history() to handle
+    "8:32 AM" / "8:32AM" / "8:32A" so we don't false-negative if the page
+    does include the slot.
+    """
     course_lower = slot["course"].lower()
-    # The receipt page shows time like "8:01A" or "8:01 AM" — normalize both
-    page_normalized = page_text.replace(" ", "").replace(":", ":")
-    time_found = time_lower in page_normalized or slot["time"].lower() in page_text
     course_found = course_lower in page_text
+
+    raw_time = slot["time"].lower()                         # "8:32 am"
+    time_no_space = raw_time.replace(" ", "")                # "8:32am"
+    time_condensed = (slot["time"]
+                      .replace(" AM", "A")
+                      .replace(" PM", "P")
+                      .lower())                              # "8:32a"
+    page_no_space = page_text.replace(" ", "")
+    time_found = (
+        raw_time in page_text
+        or time_no_space in page_no_space
+        or time_condensed in page_no_space
+    )
     return time_found and course_found
 
 
@@ -948,12 +979,22 @@ def verify_booking_via_history(page, slot: dict) -> bool:
 def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
     """Click cart button for a slot and determine result.
 
-    Returns one of: 'booked', 'taken', 'dry_run', 'session_expired', 'failed'.
+    Returns one of: 'booked', 'taken', 'dry_run', 'session_expired', 'failed',
+    'unverified_post_click'.
 
-    IMPORTANT: only returns 'booked' if a positive confirmation signal is found
-    (receipt/confirmation URL or confirmation text on page). Never assumes
-    "not on search page = booked" — that caused false positives when the slot
-    was already taken and the site showed an error page we didn't recognize.
+    Status semantics:
+      booked                 — strong confirmation signal seen; safe to record.
+      taken / failed         — booking definitively did NOT occur; safe to retry next slot.
+      session_expired        — site bumped us to login; recover and retry.
+      dry_run                — aborted before checkout per --dry-run.
+      unverified_post_click  — we clicked One Click Finish and ended up somewhere
+                                ambiguous. The booking MAY have committed at the
+                                site. Caller MUST halt the day to avoid duplicates.
+
+    The 'unverified_post_click' return is the safety net for the runaway-loop
+    bug where verification false-negatives caused 20 real bookings: once any
+    verification gap is hit after the cart click, we stop trying to book more
+    slots that day rather than risk piling on duplicates.
     """
     target_row = None
     for row in page.locator("tr:has-text('Available')").all():
@@ -1045,17 +1086,33 @@ def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
     has_text_marker = any(marker in page_text for marker in BOOKED_TEXT_MARKERS)
 
     if has_url_marker or has_text_marker:
-        # VERIFY: the confirmation page should reference our specific slot.
-        # Receipt pages show course name and time — check they match.
+        # Receipt pages show course name and time — check they match the slot.
         if verify_booking_on_page(page, slot, page_text):
             return "booked"
-        else:
-            # Confirmation URL/text but slot info missing — suspicious
-            print(f"    [book] Confirmation page shown but slot not verified")
-            save_debug_screenshot(page, f"unverified_{slot['time'].replace(' ', '_')}")
-            return "failed"
+        if has_url_marker:
+            # 4A: confirmation-shaped URL is a very strong signal that the
+            # booking committed (these substrings only appear on Vermont Systems
+            # post-checkout pages). Trust it even when text-verify fails — past
+            # behavior of returning "failed" here caused the bot to immediately
+            # book another slot, generating duplicates. Flag for manual review.
+            print(f"    [book] Confirmation URL ({final_url[:80]}) but on-page slot text mismatch — trusting URL")
+            save_debug_screenshot(page, f"url_only_{slot['time'].replace(' ', '_')}")
+            notify(
+                f"[{ACCOUNT_DISPLAY_NAME}] Booking needs manual verification",
+                f"Reached confirmation URL for {slot['time']} at {slot['course']} "
+                f"on {slot['date']} but on-page slot text didn't match. Booking "
+                f"likely succeeded — please verify in reservation history.",
+                priority="high", tags="warning",
+            )
+            return "booked"
+        # Text marker only, verification failed — booking may or may not have
+        # committed. Halt the day to be safe.
+        print(f"    [book] Confirmation text without URL marker, verify failed — halting day")
+        save_debug_screenshot(page, f"text_only_unverified_{slot['time'].replace(' ', '_')}")
+        return "unverified_post_click"
 
-    # If we're still on addtocart.html, the checkout didn't complete
+    # If we're still on addtocart.html, the checkout didn't complete.
+    # No booking committed here, so it's safe to try the next slot.
     if "addtocart" in final_url:
         if not clicked_finish:
             print(f"    [book] On cart page but couldn't find 'One Click Finish' button")
@@ -1064,8 +1121,16 @@ def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
         save_debug_screenshot(page, f"cart_stuck_{slot['time'].replace(' ', '_')}")
         return "failed"
 
-    # Unknown page — do NOT assume booked. Screenshot for debugging.
-    print(f"    [book] Ambiguous outcome (URL: {page.url[:60]})")
+    # Unknown page. If we successfully clicked One Click Finish, the booking
+    # MIGHT have committed even though we don't recognize the destination —
+    # halt the day rather than risk a duplicate. If we never clicked finish,
+    # nothing committed, so retrying the next slot is safe.
+    if clicked_finish:
+        print(f"    [book] Ambiguous URL after One Click Finish ({page.url[:80]}) — halting day")
+        save_debug_screenshot(page, f"ambiguous_post_finish_{slot['time'].replace(' ', '_')}")
+        return "unverified_post_click"
+
+    print(f"    [book] Ambiguous outcome pre-finish (URL: {page.url[:60]})")
     save_debug_screenshot(page, f"ambiguous_{slot['time'].replace(' ', '_')}")
     return "failed"
 
@@ -1147,13 +1212,46 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
                     "course": course_name,
                 }
             else:
-                print("VERIFICATION FAILED — treating as not booked")
+                # 2A: history check failed AFTER attempt_booking_click returned
+                # "booked". The booking very likely committed at the site (we got
+                # past the cart click and saw a confirmation signal); the history
+                # page just didn't reflect it yet, or the slot text rendered in an
+                # unexpected format. Previously we'd blacklist + retry the next
+                # slot — that's exactly how 20 real bookings happened. Halt the
+                # day instead and surface for manual review.
+                print("VERIFICATION FAILED — halting day to prevent duplicate bookings")
                 save_debug_screenshot(page, f"verify_failed_{slot['time'].replace(' ', '_')}")
-                blacklist.add(key)
-                # Re-navigate to search page to continue trying other slots
-                if not navigate_to_search(page, url):
-                    break
-                continue
+                notify(
+                    f"[{ACCOUNT_DISPLAY_NAME}] Booking unverified — manual check needed",
+                    f"Click reached confirmation page for {slot['time']} at {course_name} "
+                    f"on {date} but history page didn't show it. Halting further "
+                    f"bookings for this day. Please verify reservation history manually.",
+                    priority="urgent", tags="warning",
+                )
+                return {
+                    "success": False,
+                    "details": f"UNVERIFIED — possible booking at {slot['time']} at {course_name}",
+                    "course": None,
+                    "halt_day": True,
+                }
+
+        if status == "unverified_post_click":
+            # 2A: attempt_booking_click reached an ambiguous post-cart state.
+            # The booking MAY have committed. Halt the day to avoid duplicates.
+            print("UNVERIFIED post-click — halting day to prevent duplicate bookings")
+            notify(
+                f"[{ACCOUNT_DISPLAY_NAME}] Possible booking — manual check needed",
+                f"Cart click for {slot['time']} at {course_name} on {date} "
+                f"reached an ambiguous state. Halting further bookings for this "
+                f"day. Please verify reservation history manually.",
+                priority="urgent", tags="warning",
+            )
+            return {
+                "success": False,
+                "details": f"UNVERIFIED — possible booking at {slot['time']} at {course_name}",
+                "course": None,
+                "halt_day": True,
+            }
 
         if status == "dry_run":
             print("DRY-RUN OK")
@@ -1231,6 +1329,12 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
                 )
                 if result["success"]:
                     return result
+                if result.get("halt_day"):
+                    # 2A: a slot may have booked but we couldn't verify.
+                    # Stop everything for this day to prevent duplicates.
+                    print(f"  [halt] {day_name} halted after possible-but-unverified "
+                          f"booking — see notification for manual check")
+                    return result
             page.wait_for_timeout(REFRESH_BETWEEN_ROUNDS_MS)
         print(f"  {pass_label} pass exhausted for {day_name}")
 
@@ -1290,15 +1394,24 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
         if results[day_key]["success"]:
             print(f"\n=== {day_name.upper()} already booked from prior session — skipping ===")
             return
+        if results[day_key].get("halt_day"):
+            # 2A: a prior session halted this day after a possible-but-unverified
+            # booking. Don't re-attempt across session retries — that's how
+            # duplicates pile up.
+            print(f"\n=== {day_name.upper()} halted in prior session (unverified booking) — skipping ===")
+            return
         print(f"\n=== BOOKING {day_name.upper()} ===")
         results[day_key] = try_book_day(
             page, date, day_name, num_players, blacklist,
             exclude_course=exclude_course, dry_run=dry_run,
             weekend=weekend,
         )
-        # Player-count fallback: if no slots for num_players, retry with fewer
+        # Player-count fallback: if no slots for num_players, retry with fewer.
+        # 2A: skip the fallback if try_book_day halted on an unverified booking
+        # — we may have already committed and don't want to risk a second one.
         if (not results[day_key]["success"]
                 and not results[day_key].get("skipped")
+                and not results[day_key].get("halt_day")
                 and FALLBACK_NUM_PLAYERS is not None
                 and FALLBACK_NUM_PLAYERS < num_players):
             print(f"\n  === {day_name.upper()} / retrying with {FALLBACK_NUM_PLAYERS} players ===")
@@ -1307,9 +1420,12 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
                 exclude_course=exclude_course, dry_run=dry_run,
                 weekend=weekend,
             )
-        # Persist state after each day — survives a crash mid-run
-        if results[day_key]["success"]:
+        # Persist state after each day — survives a crash mid-run.
+        # Also persist halt_day so session retries don't re-attempt a day where
+        # we may have already booked but couldn't verify.
+        if results[day_key]["success"] or results[day_key].get("halt_day"):
             save_state(saturday_date, sunday_date, results)
+        if results[day_key]["success"]:
             send_ntfy(
                 f"[{ACCOUNT_DISPLAY_NAME}] {day_name.capitalize()} booked",
                 f"{results[day_key]['details']}",
@@ -1386,6 +1502,17 @@ def run_booking(args) -> dict:
                     break
                 if results["saturday"]["success"] and results["sunday"]["success"]:
                     print("\n*** Both days booked! ***")
+                    break
+                # 2A: stop retrying sessions if every day is resolved (either
+                # booked or halted for manual review). Without this we'd burn
+                # the remaining budget repeatedly logging in just to skip both
+                # halted days each session.
+                sat_done = (results["saturday"]["success"]
+                            or results["saturday"].get("halt_day"))
+                sun_done = (results["sunday"]["success"]
+                            or results["sunday"].get("halt_day"))
+                if sat_done and sun_done:
+                    print("\n*** Both days resolved (booked or halted for review) ***")
                     break
 
                 print(f"\n{'=' * 50}")
