@@ -213,3 +213,100 @@ class TestNotificationConfig:
         monkeypatch.setattr(bot, "SMTP_SERVER", None)
         # Should not raise
         bot.notify("test", "body")
+
+
+class TestVerifyBookingOnPage:
+    """Receipt-page verification must match every time format Vermont Systems
+    can render. A mismatch here previously caused the bot to mark a successful
+    booking as 'failed' and immediately re-book the next slot — producing
+    ~20 real bookings before max_time expired.
+
+    The slot's stored time is "8:32 AM"; the receipt may show:
+      - "8:32 AM"  (exact)
+      - "8:32AM"   (no space)
+      - "8:32A"    (condensed, no M)
+    All three must verify True.
+    """
+
+    SLOT = {"time": "8:32 AM", "course": "Lions", "date": "4/25/2026"}
+
+    def _check(self, receipt_html: str) -> bool:
+        # page arg is unused inside the function — None is fine here.
+        return bot.verify_booking_on_page(None, self.SLOT, receipt_html.lower())
+
+    def test_full_format_with_space(self):
+        assert self._check(
+            "<html>Receipt #12345 — Lions Municipal — 8:32 AM — 4 players</html>"
+        )
+
+    def test_full_format_no_space(self):
+        assert self._check(
+            "<html>Receipt #12345 — Lions Municipal — 8:32AM — 4 players</html>"
+        )
+
+    def test_condensed_format_no_m(self):
+        # The bug case: receipt renders "8:32A" instead of "8:32 AM"
+        assert self._check(
+            "<html>Receipt #12345 — Lions Municipal — 8:32A — 4 players</html>"
+        )
+
+    def test_pm_condensed_format(self):
+        slot = {"time": "1:32 PM", "course": "Lions", "date": "4/25/2026"}
+        assert bot.verify_booking_on_page(
+            None, slot,
+            "<html>receipt #12345 — lions — 1:32p — 4 players</html>",
+        )
+
+    def test_wrong_time_returns_false(self):
+        assert not self._check(
+            "<html>Receipt #12345 — Lions Municipal — 9:00 AM — 4 players</html>"
+        )
+
+    def test_missing_course_returns_false(self):
+        assert not self._check(
+            "<html>Receipt #12345 — 8:32 AM — 4 players</html>"
+        )
+
+
+class TestHaltDayStatePersistence:
+    """halt_day must round-trip through save/load so session retries (and
+    crash restarts) don't re-attempt a day where we may have already booked
+    but couldn't verify."""
+
+    def setup_method(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_state = bot.STATE_FILE
+        bot.STATE_FILE = f"{self._tmpdir}/state.json"
+
+    def teardown_method(self):
+        import shutil
+        bot.STATE_FILE = self._orig_state
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_halt_day_only_state_round_trips(self):
+        """If a day was halted (no success), load_state must still resume it
+        — otherwise the next session-loop iteration would re-attempt it."""
+        results = {
+            "saturday": {
+                "success": False, "details": "UNVERIFIED — possible booking",
+                "course": None, "halt_day": True,
+            },
+            "sunday": {"success": False, "details": None, "course": None},
+        }
+        bot.save_state("4/25/2026", "4/26/2026", results)
+        loaded = bot.load_state("4/25/2026", "4/26/2026")
+        assert loaded["saturday"].get("halt_day") is True
+        assert loaded["sunday"].get("halt_day") in (False, None)
+
+    def test_mixed_success_and_halt_round_trips(self):
+        results = {
+            "saturday": {"success": True, "details": "8:00 AM at Lions",
+                         "course": "Lions"},
+            "sunday": {"success": False, "details": "UNVERIFIED",
+                       "course": None, "halt_day": True},
+        }
+        bot.save_state("4/25/2026", "4/26/2026", results)
+        loaded = bot.load_state("4/25/2026", "4/26/2026")
+        assert loaded["saturday"]["success"] is True
+        assert loaded["sunday"].get("halt_day") is True
