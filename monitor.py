@@ -202,7 +202,10 @@ HTML = """<!DOCTYPE html>
   }
   .history-title { font-weight: 500; }
   .history-meta { color: var(--text-subtle); font-size: 12px; }
-  .history-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .history-table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+    table-layout: fixed;
+  }
   .history-table th {
     text-align: left; padding: 10px 16px;
     color: var(--text-subtle); font-size: 11px; font-weight: 500;
@@ -211,6 +214,7 @@ HTML = """<!DOCTYPE html>
   }
   .history-table td {
     padding: 14px 16px; border-bottom: 1px solid var(--border); color: var(--text);
+    word-wrap: break-word; overflow-wrap: break-word;
   }
   .history-table tr:last-child td { border-bottom: none; }
   .history-table tr:hover td { background: rgba(255, 255, 255, 0.02); }
@@ -307,6 +311,20 @@ function escapeHtml(t) {
   return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g, '&quot;');
 }
 
+// "Live" = log file written within this many seconds. The bot logs every few
+// seconds during every phase (queue waits print every ~10s, release-wait every
+// ~10s, login/search every action). 60s is well past every legitimate gap, so
+// staleness past this threshold means the process is gone or hung.
+const LIVE_LOG_MAX_AGE_S = 60;
+
+const TERMINAL_FAILED_PHASES = ['Login failed', 'Timed out'];
+
+// Updated by refreshAccountData each tick; read by refreshSharedState. An
+// account is "live" only when its log was just written AND its phase is not
+// a terminal state — so a finished run shows green-success, but a crashed
+// run goes gray instead of staying pulsing-green forever.
+let liveAccountIds = new Set();
+
 function phaseFromLog(lines) {
   // Walk from end — most recent signal wins
   let phase = 'Idle';
@@ -379,6 +397,8 @@ async function refreshAccounts() {
 }
 
 async function refreshAccountData() {
+  const newLive = new Set();
+  const nowSec = Math.floor(Date.now() / 1000);
   for (const acc of accounts) {
     try {
       const card = document.querySelector(`[data-account-id="${acc.id}"]`);
@@ -389,6 +409,8 @@ async function refreshAccountData() {
       ]);
       const logData = await logResp.json();
       const shotData = await shotResp.json();
+      const logMtime = logData.mtime || 0;
+      const isFresh = logMtime > 0 && (nowSec - logMtime) < LIVE_LOG_MAX_AGE_S;
 
       // Log
       const logEl = card.querySelector('[data-role="log"]');
@@ -416,12 +438,17 @@ async function refreshAccountData() {
       }
 
       const dotEl = card.querySelector('[data-role="dot"]');
-      if (phase === 'Done' || phase === 'Booking verified' || phase === 'Stopped (another account won)') {
-        dotEl.className = 'status-dot success';
-      } else if (phase === 'Login failed' || phase === 'Timed out') {
+      // Dot is a LIVE indicator: green-pulse only while the bot is actively
+      // writing logs. Terminal-success ("Done"/"Booking verified") shows gray
+      // — the badge next to the dot already carries the outcome label, and a
+      // dot that stays green forever after a finished run misled the user
+      // into thinking the bot was still racing. Terminal-failure stays red
+      // because that's worth noticing at a glance even after the fact.
+      if (TERMINAL_FAILED_PHASES.includes(phase)) {
         dotEl.className = 'status-dot failed';
-      } else if (phase !== 'Idle') {
+      } else if (phase !== 'Idle' && isFresh) {
         dotEl.className = 'status-dot active';
+        newLive.add(acc.id);
       } else {
         dotEl.className = 'status-dot';
       }
@@ -443,6 +470,7 @@ async function refreshAccountData() {
       }
     } catch (e) {}
   }
+  liveAccountIds = newLive;
 }
 
 async function refreshSharedState() {
@@ -483,15 +511,24 @@ async function refreshSharedState() {
     const text = document.getElementById('statusText');
     const totalBooked = satBookings.length + sunBookings.length;
     const totalTarget = 2 * MAX;
-    if (satBookings.length >= MAX && sunBookings.length >= MAX) {
-      dot.className = 'status-dot success';
-      text.textContent = `All ${totalTarget} tee times booked`;
-    } else if (totalBooked > 0) {
+    const allBooked = satBookings.length >= MAX && sunBookings.length >= MAX;
+    const isRunning = liveAccountIds.size > 0;
+    // Dot reflects "is the bot doing work right now" — green-pulse only while
+    // the bot is actively writing logs, gray otherwise. Previously the dot
+    // was keyed off booking count, so it showed gray during an active run
+    // with 0 bookings yet, and green-pulsing forever after a finished run.
+    // The text on the right carries the booking summary regardless of color.
+    if (isRunning) {
       dot.className = 'status-dot active';
-      text.textContent = `${totalBooked}/${totalTarget} booked — still racing`;
+      const suffix = allBooked
+        ? `all ${totalTarget} booked`
+        : `${totalBooked}/${totalTarget} booked`;
+      text.textContent = `Running — ${suffix}`;
     } else {
       dot.className = 'status-dot';
-      text.textContent = 'Idle';
+      if (allBooked) text.textContent = `All ${totalTarget} tee times booked`;
+      else if (totalBooked > 0) text.textContent = `Idle — ${totalBooked}/${totalTarget} booked`;
+      else text.textContent = 'Idle';
     }
   } catch (e) {}
 }
@@ -506,7 +543,12 @@ async function refreshNextRun() {
 }
 function tickNextRun() {
   if (nextRunSeconds > 0) nextRunSeconds -= 1;
-  document.getElementById('nextRun').textContent = nextRunSeconds <= 0 ? 'now' : formatDuration(nextRunSeconds);
+  const el = document.getElementById('nextRun');
+  if (liveAccountIds.size > 0) {
+    el.textContent = 'currently running';
+    return;
+  }
+  el.textContent = nextRunSeconds <= 0 ? 'now' : formatDuration(nextRunSeconds);
 }
 
 function renderHistory(entries) {
@@ -520,9 +562,9 @@ function renderHistory(entries) {
   let html = '<table class="history-table"><thead><tr>';
   html += '<th style="width:140px">Run date</th>';
   html += '<th style="width:110px">Status</th>';
-  html += '<th>Saturday</th>';
-  html += '<th>Sunday</th>';
-  html += '<th style="width:140px">Booked by</th>';
+  html += '<th style="width:auto">Saturday</th>';
+  html += '<th style="width:auto">Sunday</th>';
+  html += '<th style="width:160px">Booked by</th>';
   html += '</tr></thead><tbody>';
   for (const e of entries) {
     const sat = e.results?.saturday;
@@ -587,8 +629,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif path.startswith("/api/log/"):
             account_id = path.split("/", 3)[3]
-            lines = read_log_tail(per_account_paths(account_id)["log"], n_lines=30)
-            self._json({"lines": lines})
+            log_path = per_account_paths(account_id)["log"]
+            lines = read_log_tail(log_path, n_lines=30)
+            mtime = int(os.path.getmtime(log_path)) if os.path.exists(log_path) else 0
+            self._json({"lines": lines, "mtime": mtime})
 
         elif path.startswith("/api/screenshot_info/"):
             account_id = path.split("/", 3)[3]
