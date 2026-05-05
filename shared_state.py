@@ -152,6 +152,30 @@ def day_already_booked(weekend: str, day: str) -> tuple[bool, list]:
     return is_full, [b.get("booked_by") for b in bookings if b.get("booked_by")]
 
 
+def courses_booked_on(weekend: str, day: str) -> set:
+    """Return the set of course names already claimed by ANY account on `day`.
+
+    Used by try_book_day for cross-account course coordination: each account
+    prefers a course no sibling has claimed yet, so 3 racing accounts spread
+    across 3 different courses instead of all piling onto Lions.
+
+    Course is parsed from `details` strings like "8:40 AM at Lions" — the
+    text after the last ` at `. Defensive against missing/malformed entries.
+    """
+    state = read_shared(weekend)
+    entry = state.get(day) or {}
+    bookings = entry.get("bookings", []) or []
+    courses = set()
+    for b in bookings:
+        details = b.get("details") or ""
+        idx = details.rfind(" at ")
+        if idx > 0:
+            course = details[idx + 4:].strip()
+            if course:
+                courses.add(course)
+    return courses
+
+
 def clear_shared_state() -> None:
     """Remove the shared state file."""
     try:
