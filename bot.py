@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import urllib.request
+from urllib.parse import parse_qs, urlparse
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -900,6 +901,35 @@ BOOKED_TEXT_MARKERS = (
 HISTORY_URL = f"{BASE_URL}/history.html?historyoption=inquiry"
 
 
+# 1A — CSRF token tracking
+# ------------------------
+# Vermont Systems issues a unique `_csrf_token` query param per real
+# checkout commit. After a successful booking, subsequent "Add to Cart"
+# clicks can land back on the SAME cached confirmation page (same token)
+# without committing a new booking. The URL-marker check would then
+# trust this stale page as a fresh booking and call it "booked" —
+# which is how we got phantom Sunday entries in history.json on
+# 2026-05-04.
+#
+# Defence: track every CSRF token we've seen on a "looks-booked" URL.
+# If a confirmation URL reuses a token we've already seen, the click
+# didn't fire — return unverified_post_click instead of "booked".
+#
+# Module-level state because each account runs as its own subprocess;
+# the set is naturally scoped to that subprocess's lifetime.
+_seen_csrf_tokens: set[str] = set()
+
+
+def _extract_csrf_token(url: str) -> str | None:
+    """Pull the `_csrf_token` query param out of a URL, if present."""
+    try:
+        params = parse_qs(urlparse(url).query)
+        token = params.get("_csrf_token", [None])[0]
+        return token or None
+    except Exception:
+        return None
+
+
 def verify_booking_on_page(page, slot: dict, page_text: str) -> bool:
     """Quick first-pass verification: does the current page reference our slot?
 
@@ -1086,6 +1116,19 @@ def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
     has_text_marker = any(marker in page_text for marker in BOOKED_TEXT_MARKERS)
 
     if has_url_marker or has_text_marker:
+        # 1A: CSRF reuse detection. Vermont Systems issues a fresh
+        # `_csrf_token` per real commit. If we see a confirmation URL with a
+        # token already seen in this run, the click landed on the cached
+        # confirmation page from an earlier real booking — no new booking
+        # actually happened. Halt instead of trusting it as "booked".
+        token = _extract_csrf_token(page.url)
+        if token and token in _seen_csrf_tokens:
+            print(f"    [book] CSRF token {token!r} already seen — phantom click on cached confirmation page")
+            save_debug_screenshot(page, f"csrf_reuse_{slot['time'].replace(' ', '_')}")
+            return "unverified_post_click"
+        if token:
+            _seen_csrf_tokens.add(token)
+
         # Receipt pages show course name and time — check they match the slot.
         if verify_booking_on_page(page, slot, page_text):
             return "booked"
@@ -1262,9 +1305,39 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
             }
 
         if status == "session_expired":
-            print("session expired")
+            # 2A: a "session_expired" right after clicking Add to Cart can
+            # actually be a SUCCESSFUL booking. Vermont Systems sometimes
+            # redirects to login.html after issuing the receipt — the booking
+            # committed server-side, but the page state looks like a logged-out
+            # session to the bot. On 2026-05-04 Grant booked Lions 8:40 AM but
+            # the bot saw login.html, declared "session expired," and moved on
+            # — so the real booking never made it into history.json. Now: log
+            # back in, then check the reservation-history page for the slot we
+            # just clicked. If it shows up, treat as booked.
+            print("session expired — checking if booking committed anyway")
             if not login_with_retry(page, queue_mode="timeout"):
                 return result
+            if verify_booking_via_history(page, slot):
+                print(f"    [recovery] Booking found in history despite session expiry — treating as booked")
+                details = f"{slot['time']} at {course_name}"
+                if weekend and day_name:
+                    claimed, cur_state = shared_state.claim_booking(
+                        weekend, day_name, details, ACCOUNT_ID,
+                    )
+                    if not claimed:
+                        existing = (cur_state.get(day_name) or {}).get("bookings", [])
+                        existing_names = ", ".join(b.get("booked_by", "?") for b in existing)
+                        send_ntfy(
+                            f"[{ACCOUNT_DISPLAY_NAME}] DUPLICATE booking on {day_name}",
+                            f"{day_name.capitalize()} already booked by: {existing_names}. "
+                            f"Mine ({details}) is extra — cancel manually.",
+                            priority="urgent", tags="warning",
+                        )
+                return {
+                    "success": True,
+                    "details": details,
+                    "course": course_name,
+                }
             if not navigate_to_search(page, url):
                 return result
             # DOM state is stale now — bail to outer loop
@@ -1319,22 +1392,44 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
                 if is_full:
                     print(f"  [coord] {day_name} hit capacity ({', '.join(booked_by_list)}) — stopping")
                     return {"success": False, "details": None, "course": None, "skipped": True}
-            for course_code, course_name in COURSE_CODES.items():
-                if exclude_course and course_name == exclude_course:
-                    continue
-                result = search_and_book_course(
-                    page, course_code, course_name, date, num_players,
-                    max_hour, blacklist, dry_run=dry_run,
-                    weekend=weekend, day_name=day_name,
-                )
-                if result["success"]:
-                    return result
-                if result.get("halt_day"):
-                    # 2A: a slot may have booked but we couldn't verify.
-                    # Stop everything for this day to prevent duplicates.
-                    print(f"  [halt] {day_name} halted after possible-but-unverified "
-                          f"booking — see notification for manual check")
-                    return result
+            # 3A: two-phase course iteration. Try unclaimed courses first
+            # (in priority order), then fall back to courses already claimed
+            # by sibling accounts only if every unclaimed course had no slots
+            # in this round. This spreads 3 racing accounts across 3 courses
+            # instead of all piling onto Lions, while still preserving the
+            # priority order. Recompute claimed-set before each phase so a
+            # sibling claim mid-round takes effect immediately.
+            for prefer_unclaimed in (True, False):
+                claimed = (shared_state.courses_booked_on(weekend, day_name)
+                           if weekend else set())
+                phase = "primary" if prefer_unclaimed else "fallback"
+                if not prefer_unclaimed and not claimed:
+                    # No claimed courses yet → fallback phase is identical to
+                    # primary, skip to avoid wasted re-attempts.
+                    break
+                for course_code, course_name in COURSE_CODES.items():
+                    if exclude_course and course_name == exclude_course:
+                        continue
+                    is_claimed = course_name in claimed
+                    if prefer_unclaimed and is_claimed:
+                        continue
+                    if (not prefer_unclaimed) and (not is_claimed):
+                        continue
+                    if not prefer_unclaimed:
+                        print(f"  [coord] {course_name} already claimed — falling back to it")
+                    result = search_and_book_course(
+                        page, course_code, course_name, date, num_players,
+                        max_hour, blacklist, dry_run=dry_run,
+                        weekend=weekend, day_name=day_name,
+                    )
+                    if result["success"]:
+                        return result
+                    if result.get("halt_day"):
+                        # 2A: a slot may have booked but we couldn't verify.
+                        # Stop everything for this day to prevent duplicates.
+                        print(f"  [halt] {day_name} halted after possible-but-unverified "
+                              f"booking — see notification for manual check")
+                        return result
             page.wait_for_timeout(REFRESH_BETWEEN_ROUNDS_MS)
         print(f"  {pass_label} pass exhausted for {day_name}")
 

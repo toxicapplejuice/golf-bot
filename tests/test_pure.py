@@ -310,3 +310,120 @@ class TestHaltDayStatePersistence:
         loaded = bot.load_state("4/25/2026", "4/26/2026")
         assert loaded["saturday"]["success"] is True
         assert loaded["sunday"].get("halt_day") is True
+
+
+class TestExtractCsrfToken:
+    """1A: when Vermont Systems redirects to a confirmation page after a real
+    commit, the URL has a fresh `_csrf_token` query param. Subsequent clicks
+    that land on a CACHED confirmation page reuse the same token. We detect
+    that to refuse trusting stale "looks-booked" pages as new bookings.
+
+    On 2026-05-04 each account got exactly one CSRF token but the URL-marker
+    check trusted three confirmation URLs per account, producing two
+    phantom Sunday entries in history.json.
+    """
+
+    def test_extracts_token(self):
+        url = "https://txaustinweb.myvscloud.com/webtrac/web/confirmation.html?_csrf_token=de0w"
+        assert bot._extract_csrf_token(url) == "de0w"
+
+    def test_token_with_other_params(self):
+        url = "https://example.com/confirmation.html?foo=bar&_csrf_token=mx6j&baz=1"
+        assert bot._extract_csrf_token(url) == "mx6j"
+
+    def test_no_query_string_returns_none(self):
+        assert bot._extract_csrf_token("https://example.com/page") is None
+
+    def test_no_csrf_param_returns_none(self):
+        assert bot._extract_csrf_token("https://example.com/page?other=1") is None
+
+    def test_empty_csrf_param_returns_none(self):
+        # `?_csrf_token=` (empty value) shouldn't be tracked as a real token.
+        assert bot._extract_csrf_token("https://example.com/p?_csrf_token=") is None
+
+    def test_handles_garbage_input(self):
+        # parse_qs is permissive; this should not raise.
+        assert bot._extract_csrf_token("not a url at all") is None
+
+
+class TestCoursesBookedOn:
+    """3A: shared_state.courses_booked_on parses booking detail strings
+    ('8:40 AM at Lions') into a course-name set, used by try_book_day to
+    spread sibling accounts across different courses."""
+
+    def setup_method(self):
+        import shared_state
+        import tempfile
+        self._shared_state = shared_state
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_path = shared_state.SHARED_STATE_FILE
+        shared_state.SHARED_STATE_FILE = f"{self._tmpdir}/shared.json"
+
+    def teardown_method(self):
+        import shutil
+        self._shared_state.SHARED_STATE_FILE = self._orig_path
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _seed(self, weekend: str, sat_bookings, sun_bookings):
+        import json
+        with open(self._shared_state.SHARED_STATE_FILE, "w") as f:
+            json.dump({
+                "weekend": weekend,
+                "saturday": {"bookings": sat_bookings},
+                "sunday": {"bookings": sun_bookings},
+            }, f)
+
+    def test_empty_returns_empty_set(self):
+        self._seed("5/09/2026 - 5/10/2026", [], [])
+        assert self._shared_state.courses_booked_on("5/09/2026 - 5/10/2026", "saturday") == set()
+
+    def test_single_booking(self):
+        self._seed("5/09/2026 - 5/10/2026",
+                   [{"booked_by": "michael", "details": "8:40 AM at Lions"}], [])
+        assert self._shared_state.courses_booked_on(
+            "5/09/2026 - 5/10/2026", "saturday") == {"Lions"}
+
+    def test_multiple_distinct_courses(self):
+        self._seed("5/09/2026 - 5/10/2026", [
+            {"booked_by": "michael", "details": "1:01 PM at Roy Kizer"},
+            {"booked_by": "grant", "details": "8:40 AM at Lions"},
+        ], [])
+        assert self._shared_state.courses_booked_on(
+            "5/09/2026 - 5/10/2026", "saturday") == {"Roy Kizer", "Lions"}
+
+    def test_dedupes_same_course(self):
+        self._seed("5/09/2026 - 5/10/2026", [
+            {"booked_by": "michael", "details": "1:01 PM at Roy Kizer"},
+            {"booked_by": "christian", "details": "4:51 PM at Roy Kizer"},
+        ], [])
+        assert self._shared_state.courses_booked_on(
+            "5/09/2026 - 5/10/2026", "saturday") == {"Roy Kizer"}
+
+    def test_per_day_isolation(self):
+        self._seed("5/09/2026 - 5/10/2026",
+                   [{"booked_by": "michael", "details": "1:01 PM at Roy Kizer"}],
+                   [{"booked_by": "grant", "details": "8:40 AM at Lions"}])
+        assert self._shared_state.courses_booked_on(
+            "5/09/2026 - 5/10/2026", "saturday") == {"Roy Kizer"}
+        assert self._shared_state.courses_booked_on(
+            "5/09/2026 - 5/10/2026", "sunday") == {"Lions"}
+
+    def test_handles_malformed_details(self):
+        self._seed("5/09/2026 - 5/10/2026", [
+            {"booked_by": "x", "details": "8:40 AM at Lions"},
+            {"booked_by": "y", "details": ""},                  # empty
+            {"booked_by": "z", "details": "no-marker-here"},    # no " at "
+            {"booked_by": "w", "details": None},                # null
+            {"booked_by": "v"},                                  # no details key
+        ], [])
+        assert self._shared_state.courses_booked_on(
+            "5/09/2026 - 5/10/2026", "saturday") == {"Lions"}
+
+    def test_course_with_spaces(self):
+        # "Roy Kizer", "Morris Williams" — two-word course names mustn't be
+        # truncated by a too-eager split.
+        self._seed("5/09/2026 - 5/10/2026", [
+            {"booked_by": "x", "details": "8:00 AM at Morris Williams"},
+        ], [])
+        assert self._shared_state.courses_booked_on(
+            "5/09/2026 - 5/10/2026", "saturday") == {"Morris Williams"}
