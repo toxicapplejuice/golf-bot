@@ -743,7 +743,7 @@ function renderWatches(watches) {
     }
 
     const cancelBtn = w.status === 'watching'
-      ? '<button class="cancel-btn" onclick="cancelWatch(\'' + escapeHtml(w.id) + '\')">Cancel</button>'
+      ? '<button class="cancel-btn" onclick="cancelWatch(\\'' + escapeHtml(w.id) + '\\')">Cancel</button>'
       : '';
 
     html += '<div class="watch-card">'
