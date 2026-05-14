@@ -75,6 +75,52 @@ python3 bot.py --now --dry-run --headful
   before submitting. Safe to run against the live site.
 - `--headful` — show the Firefox window (default is headless)
 
+## Standby Watch (cancellation polling)
+
+If you miss the Monday 8PM rush, queue a "standby watch" that polls for
+cancellations every 30 minutes. Uses one account to search + book.
+
+### CLI
+
+```bash
+# Add a watch for this weekend
+python3 standby_bot.py add --day saturday --day sunday --time morning
+python3 standby_bot.py add --day saturday --time afternoon --players 2
+
+# List active watches
+python3 standby_bot.py list
+
+# Cancel a watch
+python3 standby_bot.py cancel <id>
+
+# Run one check cycle manually
+python3 standby_bot.py check
+python3 standby_bot.py check --dry-run --headful
+```
+
+### Crontab (every 30 min, Tue–Sat)
+
+```
+*/30 * * * 2-6 /usr/bin/python3 -u /Users/michaelhsu/golf-bot/standby_bot.py check >> /Users/michaelhsu/golf-bot/standby.log 2>&1
+```
+
+### Dashboard
+
+The monitor dashboard (localhost:8111) shows the "Standby Watch" section
+with active watches, check counts, and results. You can add/cancel
+watches directly from the UI.
+
+### How it works
+
+- `standby_queue.py` manages the watch queue (`standby_queue.json`)
+- `standby_bot.py check` reads active watches, logs in, searches all
+  courses for each requested day/time, books if found
+- Time prefs: `morning` (8am–1pm), `afternoon` (1pm–5pm), `all` (8am–5pm)
+- Player fallback: if no slots for requested count, retries with
+  FALLBACK_NUM_PLAYERS (2)
+- Watches auto-expire Sunday 11:59 PM (end of the target weekend)
+- Old terminal watches are cleaned up after 14 days
+
 ## Tests
 
 ```bash
@@ -85,6 +131,9 @@ python3 -m pytest tests/ -q
 for both morning and fallback windows, get_time_priority ordering,
 get_next_weekend_dates, phantom blacklist tuple shape, course config
 integrity, and player-count fallback config). 30 tests.
+
+`tests/test_standby.py` covers standby queue operations (add, cancel,
+expire, mark booked, active filtering, cleanup). 67 tests.
 
 There are no browser-integration tests — the only way to verify the
 Playwright path is `--dry-run` against the live site.

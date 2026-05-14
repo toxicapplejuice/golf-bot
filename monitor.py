@@ -13,6 +13,8 @@ import json
 import os
 from datetime import datetime, timedelta
 
+import standby_queue
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_screenshots")
 HISTORY_FILE = os.path.join(SCRIPT_DIR, "history.json")
@@ -230,6 +232,52 @@ HTML = """<!DOCTYPE html>
   .badge.danger  { background: var(--danger-bg); color: var(--danger); }
   .badge.warning { background: var(--warning-bg); color: var(--warning); }
   .badge-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  /* Standby Watch */
+  .standby-panel {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; margin-bottom: 24px; overflow: hidden;
+  }
+  .standby-header {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .standby-title { font-weight: 500; font-size: 13px; }
+  .standby-add-btn {
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 12px; font-size: 12px; cursor: pointer;
+  }
+  .standby-add-btn:hover { background: var(--border); }
+  .standby-form {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  }
+  .standby-form label {
+    font-size: 12px; color: var(--text-muted); display: flex;
+    align-items: center; gap: 4px; cursor: pointer;
+  }
+  .standby-form select, .standby-form .form-btn {
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 8px; font-size: 12px;
+  }
+  .standby-form .form-btn { cursor: pointer; }
+  .standby-form .form-btn:hover { background: var(--border); }
+  .watch-card {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px;
+  }
+  .watch-card:last-child { border-bottom: none; }
+  .watch-info { flex: 1; min-width: 0; }
+  .watch-summary { font-size: 13px; color: var(--text); }
+  .watch-meta { font-size: 11px; color: var(--text-subtle); margin-top: 2px; }
+  .watch-results { font-size: 12px; color: var(--text-muted); display: flex; gap: 12px; }
+  .watch-results .result-booked { color: var(--success); }
+  .cancel-btn {
+    background: transparent; color: var(--text-subtle); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer;
+    flex-shrink: 0;
+  }
+  .cancel-btn:hover { color: var(--danger); border-color: var(--danger); }
 </style>
 </head>
 <body>
@@ -257,6 +305,32 @@ HTML = """<!DOCTYPE html>
       <span class="shared-label">Sunday</span>
       <span class="shared-value pending" id="sharedSun">—</span>
       <span class="shared-detail" id="sharedSunBy"></span>
+    </div>
+  </div>
+
+  <!-- Standby Watch -->
+  <div class="standby-panel">
+    <div class="standby-header">
+      <span class="standby-title">Standby Watch</span>
+      <button class="standby-add-btn" onclick="toggleAddForm()">+ Add Watch</button>
+    </div>
+    <div class="standby-form" id="standbyForm" style="display:none">
+      <label><input type="checkbox" id="cbSat" checked> Sat</label>
+      <label><input type="checkbox" id="cbSun" checked> Sun</label>
+      <select id="timePref">
+        <option value="morning">Morning (8am–1pm)</option>
+        <option value="afternoon">Afternoon (1pm–5pm)</option>
+        <option value="all">All Day (8am–5pm)</option>
+      </select>
+      <select id="playerCount">
+        <option value="4">4 players</option>
+        <option value="3">3 players</option>
+        <option value="2">2 players</option>
+      </select>
+      <button class="form-btn" onclick="submitWatch()">Add Watch</button>
+    </div>
+    <div id="standbyBody">
+      <div class="empty-state" id="standbyEmpty">No active watches</div>
     </div>
   </div>
 
@@ -601,12 +675,103 @@ async function refreshHistory() {
   } catch (e) {}
 }
 
+// Standby Watch
+function toggleAddForm() {
+  const form = document.getElementById('standbyForm');
+  form.style.display = form.style.display === 'none' ? 'flex' : 'none';
+}
+
+async function submitWatch() {
+  const days = [];
+  if (document.getElementById('cbSat').checked) days.push('saturday');
+  if (document.getElementById('cbSun').checked) days.push('sunday');
+  if (!days.length) { alert('Select at least one day'); return; }
+  try {
+    const resp = await fetch('/api/standby/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        days: days,
+        time_pref: document.getElementById('timePref').value,
+        players: parseInt(document.getElementById('playerCount').value),
+      }),
+    });
+    if (resp.ok) {
+      document.getElementById('standbyForm').style.display = 'none';
+      refreshStandby();
+    }
+  } catch (e) {}
+}
+
+async function cancelWatch(id) {
+  try {
+    await fetch('/api/standby/' + id + '/cancel', {method: 'POST'});
+    refreshStandby();
+  } catch (e) {}
+}
+
+function renderWatches(watches) {
+  const body = document.getElementById('standbyBody');
+  const active = watches.filter(w => w.status === 'watching');
+  const recent = watches.filter(w => w.status !== 'watching').slice(0, 3);
+  const all = [...active, ...recent];
+
+  if (!all.length) {
+    body.innerHTML = '<div class="empty-state">No active watches</div>';
+    return;
+  }
+
+  let html = '';
+  const prefLabels = {morning: 'Morning', afternoon: 'Afternoon', all: 'All Day'};
+  for (const w of all) {
+    const days = w.days.map(d => d.charAt(0).toUpperCase() + d.slice(1, 3)).join(' + ');
+    const timePref = prefLabels[w.time_pref] || w.time_pref;
+    const statusCls = ({watching:'warning', booked:'success'})[w.status] || '';
+    const statusStyle = statusCls ? '' : 'background:var(--surface);color:var(--text-muted)';
+    const statusLabel = w.status.charAt(0).toUpperCase() + w.status.slice(1);
+    const lastCheck = w.last_checked_at ? formatTimestamp(w.last_checked_at) : 'never';
+
+    let results = '';
+    for (const d of w.days) {
+      const r = (w.results || {})[d];
+      if (r && r.booked) {
+        results += '<span class="result-booked">' + d.charAt(0).toUpperCase() + d.slice(1,3)
+                   + ': ' + escapeHtml(r.details) + '</span>';
+      } else {
+        results += '<span>' + d.charAt(0).toUpperCase() + d.slice(1,3) + ': pending</span>';
+      }
+    }
+
+    const cancelBtn = w.status === 'watching'
+      ? '<button class="cancel-btn" onclick="cancelWatch(\'' + escapeHtml(w.id) + '\')">Cancel</button>'
+      : '';
+
+    html += '<div class="watch-card">'
+      + '<span class="badge ' + statusCls + '" style="' + statusStyle + '"><span class="badge-dot"></span>' + statusLabel + '</span>'
+      + '<div class="watch-info"><div class="watch-summary">' + escapeHtml(days) + ' &mdash; ' + escapeHtml(timePref) + ' &mdash; ' + w.players + 'p</div>'
+      + '<div class="watch-meta">Checked ' + (w.check_count||0) + 'x &middot; Last: ' + escapeHtml(lastCheck) + '</div></div>'
+      + '<div class="watch-results">' + results + '</div>'
+      + cancelBtn
+      + '</div>';
+  }
+  body.innerHTML = html;
+}
+
+async function refreshStandby() {
+  try {
+    const resp = await fetch('/api/standby');
+    const watches = await resp.json();
+    renderWatches(watches);
+  } catch (e) {}
+}
+
 setInterval(refreshAccounts, 30000);
 setInterval(refreshAccountData, 2000);
 setInterval(refreshSharedState, 2000);
 setInterval(refreshHistory, 10000);
 setInterval(tickNextRun, 1000);
 setInterval(refreshNextRun, 60000);
+setInterval(refreshStandby, 10000);
 
 (async () => {
   await refreshAccounts();
@@ -614,6 +779,7 @@ setInterval(refreshNextRun, 60000);
   refreshSharedState();
   refreshHistory();
   refreshNextRun();
+  refreshStandby();
 })();
 </script>
 </body>
@@ -676,6 +842,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/next_run":
             self._json({"seconds": seconds_until_next_monday_745pm()})
 
+        elif path == "/api/standby":
+            standby_queue.expire_stale_watches()
+            self._json(standby_queue.list_watches())
+
         elif path == "/api/history":
             try:
                 with open(HISTORY_FILE, "r") as f:
@@ -693,12 +863,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404); self.end_headers()
 
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        path = self.path.split("?")[0]
+
+        if path == "/api/standby/add":
+            try:
+                data = json.loads(body)
+                watch = standby_queue.add_watch(
+                    days=data["days"],
+                    time_pref=data.get("time_pref", "morning"),
+                    players=data.get("players", 4),
+                )
+                self._json(watch)
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                self._json_error(str(e), 400)
+
+        elif path.startswith("/api/standby/") and path.endswith("/cancel"):
+            parts = path.strip("/").split("/")
+            if len(parts) >= 3:
+                watch_id = parts[2]
+                if standby_queue.cancel_watch(watch_id):
+                    self._json({"ok": True})
+                else:
+                    self._json_error("Watch not found or not active", 404)
+            else:
+                self._json_error("Invalid path", 400)
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def _json(self, obj):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(json.dumps(obj).encode())
+
+    def _json_error(self, msg, status=400):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": msg}).encode())
 
     def log_message(self, format, *args):
         pass

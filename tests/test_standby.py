@@ -1,0 +1,317 @@
+"""Tests for standby_queue.py standby watch functionality."""
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import standby_queue  # noqa: E402
+
+
+class TestTimePrefRanges:
+    def test_morning_range(self):
+        assert standby_queue.TIME_PREF_RANGES["morning"] == (8, 13)
+
+    def test_afternoon_range(self):
+        assert standby_queue.TIME_PREF_RANGES["afternoon"] == (13, 17)
+
+    def test_all_range(self):
+        assert standby_queue.TIME_PREF_RANGES["all"] == (8, 17)
+
+    def test_valid_time_prefs_match_keys(self):
+        assert set(standby_queue.VALID_TIME_PREFS) == set(standby_queue.TIME_PREF_RANGES.keys())
+
+
+class TestComputeExpiry:
+    def test_sunday_end_of_day(self):
+        result = standby_queue._compute_expiry("5/18/2026")
+        assert result == "2026-05-18T23:59:59"
+
+    def test_handles_padded_month(self):
+        result = standby_queue._compute_expiry("12/07/2026")
+        assert result == "2026-12-07T23:59:59"
+
+    def test_handles_single_digit_month(self):
+        result = standby_queue._compute_expiry("1/04/2026")
+        assert result == "2026-01-04T23:59:59"
+
+
+class TestGetUpcomingWeekendDates:
+    def test_weekday_returns_this_saturday(self):
+        # Wednesday May 14 2026 -> Saturday May 16 2026
+        with patch("standby_queue.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 5, 14, 10, 0, 0)
+            mock_dt.strptime = datetime.strptime
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            sat, sun = standby_queue.get_upcoming_weekend_dates()
+        assert "16" in sat
+        assert "17" in sun
+
+    def test_saturday_returns_today(self):
+        with patch("standby_queue.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 5, 16, 10, 0, 0)
+            mock_dt.strptime = datetime.strptime
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            sat, sun = standby_queue.get_upcoming_weekend_dates()
+        assert "16" in sat
+        assert "17" in sun
+
+    def test_sunday_returns_yesterday_saturday(self):
+        with patch("standby_queue.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 5, 17, 10, 0, 0)
+            mock_dt.strptime = datetime.strptime
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            sat, sun = standby_queue.get_upcoming_weekend_dates()
+        assert "16" in sat
+        assert "17" in sun
+
+
+class TestAddWatch:
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_file = standby_queue.QUEUE_FILE
+        standby_queue.QUEUE_FILE = os.path.join(self._tmpdir, "standby_queue.json")
+
+    def teardown_method(self):
+        standby_queue.QUEUE_FILE = self._orig_file
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_add_basic_watch(self):
+        watch = standby_queue.add_watch(["saturday", "sunday"], "morning", 4)
+        assert watch["status"] == "watching"
+        assert watch["days"] == ["saturday", "sunday"]
+        assert watch["time_pref"] == "morning"
+        assert watch["players"] == 4
+        assert watch["check_count"] == 0
+        assert watch["last_checked_at"] is None
+        assert "saturday" in watch["target_dates"]
+        assert "sunday" in watch["target_dates"]
+        assert watch["results"]["saturday"] is None
+        assert watch["results"]["sunday"] is None
+        assert len(watch["id"]) == 8
+
+    def test_add_single_day_watch(self):
+        watch = standby_queue.add_watch(["saturday"], "afternoon", 2)
+        assert watch["days"] == ["saturday"]
+        assert watch["time_pref"] == "afternoon"
+        assert watch["players"] == 2
+        assert "sunday" not in watch["target_dates"]
+
+    def test_add_persists_to_file(self):
+        standby_queue.add_watch(["saturday"], "morning", 4)
+        standby_queue.add_watch(["sunday"], "all", 2)
+        watches = standby_queue.list_watches()
+        assert len(watches) == 2
+
+    def test_invalid_day_raises(self):
+        try:
+            standby_queue.add_watch(["monday"], "morning", 4)
+            assert False, "Expected ValueError"
+        except ValueError as e:
+            assert "monday" in str(e)
+
+    def test_invalid_time_pref_raises(self):
+        try:
+            standby_queue.add_watch(["saturday"], "evening", 4)
+            assert False, "Expected ValueError"
+        except ValueError as e:
+            assert "evening" in str(e)
+
+    def test_invalid_players_raises(self):
+        try:
+            standby_queue.add_watch(["saturday"], "morning", 0)
+            assert False, "Expected ValueError"
+        except ValueError:
+            pass
+        try:
+            standby_queue.add_watch(["saturday"], "morning", 5)
+            assert False, "Expected ValueError"
+        except ValueError:
+            pass
+
+
+class TestCancelWatch:
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_file = standby_queue.QUEUE_FILE
+        standby_queue.QUEUE_FILE = os.path.join(self._tmpdir, "standby_queue.json")
+
+    def teardown_method(self):
+        standby_queue.QUEUE_FILE = self._orig_file
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_cancel_existing_watch(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        assert standby_queue.cancel_watch(watch["id"]) is True
+        watches = standby_queue.list_watches()
+        assert watches[0]["status"] == "cancelled"
+
+    def test_cancel_nonexistent_returns_false(self):
+        assert standby_queue.cancel_watch("nonexistent") is False
+
+    def test_cancel_already_cancelled_returns_false(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        standby_queue.cancel_watch(watch["id"])
+        assert standby_queue.cancel_watch(watch["id"]) is False
+
+
+class TestMarkDayBooked:
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_file = standby_queue.QUEUE_FILE
+        standby_queue.QUEUE_FILE = os.path.join(self._tmpdir, "standby_queue.json")
+
+    def teardown_method(self):
+        standby_queue.QUEUE_FILE = self._orig_file
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_mark_single_day_completes_watch(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        standby_queue.mark_day_booked(watch["id"], "saturday", "8:32 AM at Lions")
+        watches = standby_queue.list_watches()
+        assert watches[0]["status"] == "booked"
+        assert watches[0]["results"]["saturday"]["booked"] is True
+        assert watches[0]["results"]["saturday"]["details"] == "8:32 AM at Lions"
+
+    def test_mark_one_of_two_days_stays_watching(self):
+        watch = standby_queue.add_watch(["saturday", "sunday"], "morning", 4)
+        standby_queue.mark_day_booked(watch["id"], "saturday", "8:32 AM at Lions")
+        watches = standby_queue.list_watches()
+        assert watches[0]["status"] == "watching"
+        assert watches[0]["results"]["saturday"]["booked"] is True
+        assert watches[0]["results"]["sunday"] is None
+
+    def test_mark_both_days_completes_watch(self):
+        watch = standby_queue.add_watch(["saturday", "sunday"], "morning", 4)
+        standby_queue.mark_day_booked(watch["id"], "saturday", "8:32 AM at Lions")
+        standby_queue.mark_day_booked(watch["id"], "sunday", "9:00 AM at Roy Kizer")
+        watches = standby_queue.list_watches()
+        assert watches[0]["status"] == "booked"
+
+
+class TestExpireStaleWatches:
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_file = standby_queue.QUEUE_FILE
+        standby_queue.QUEUE_FILE = os.path.join(self._tmpdir, "standby_queue.json")
+
+    def teardown_method(self):
+        standby_queue.QUEUE_FILE = self._orig_file
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_future_watch_not_expired(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        count = standby_queue.expire_stale_watches()
+        assert count == 0
+        watches = standby_queue.list_watches()
+        assert watches[0]["status"] == "watching"
+
+    def test_past_watch_gets_expired(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        # Manually set expires_at to the past
+        with standby_queue._locked_file(standby_queue.QUEUE_FILE, "r+") as f:
+            data = standby_queue._load(f)
+            data["watches"][0]["expires_at"] = "2020-01-01T23:59:59"
+            standby_queue._save(f, data)
+        count = standby_queue.expire_stale_watches()
+        assert count == 1
+        watches = standby_queue.list_watches()
+        assert watches[0]["status"] == "expired"
+
+    def test_already_booked_not_expired(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        standby_queue.mark_day_booked(watch["id"], "saturday", "8:00 AM at Lions")
+        count = standby_queue.expire_stale_watches()
+        assert count == 0
+
+
+class TestUpdateWatchCheck:
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_file = standby_queue.QUEUE_FILE
+        standby_queue.QUEUE_FILE = os.path.join(self._tmpdir, "standby_queue.json")
+
+    def teardown_method(self):
+        standby_queue.QUEUE_FILE = self._orig_file
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_increments_check_count(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        standby_queue.update_watch_check(watch["id"])
+        standby_queue.update_watch_check(watch["id"])
+        watches = standby_queue.list_watches()
+        assert watches[0]["check_count"] == 2
+        assert watches[0]["last_checked_at"] is not None
+
+
+class TestGetActiveWatches:
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_file = standby_queue.QUEUE_FILE
+        standby_queue.QUEUE_FILE = os.path.join(self._tmpdir, "standby_queue.json")
+
+    def teardown_method(self):
+        standby_queue.QUEUE_FILE = self._orig_file
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_returns_only_watching(self):
+        w1 = standby_queue.add_watch(["saturday"], "morning", 4)
+        w2 = standby_queue.add_watch(["sunday"], "morning", 4)
+        standby_queue.cancel_watch(w2["id"])
+        active = standby_queue.get_active_watches()
+        assert len(active) == 1
+        assert active[0]["id"] == w1["id"]
+
+    def test_excludes_expired(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        with standby_queue._locked_file(standby_queue.QUEUE_FILE, "r+") as f:
+            data = standby_queue._load(f)
+            data["watches"][0]["expires_at"] = "2020-01-01T23:59:59"
+            standby_queue._save(f, data)
+        active = standby_queue.get_active_watches()
+        assert len(active) == 0
+
+
+class TestClearOldWatches:
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_file = standby_queue.QUEUE_FILE
+        standby_queue.QUEUE_FILE = os.path.join(self._tmpdir, "standby_queue.json")
+
+    def teardown_method(self):
+        standby_queue.QUEUE_FILE = self._orig_file
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_removes_old_terminal_watches(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        standby_queue.cancel_watch(watch["id"])
+        # Set created_at to 30 days ago
+        with standby_queue._locked_file(standby_queue.QUEUE_FILE, "r+") as f:
+            data = standby_queue._load(f)
+            data["watches"][0]["created_at"] = "2020-01-01T00:00:00"
+            standby_queue._save(f, data)
+        removed = standby_queue.clear_old_watches(keep_days=14)
+        assert removed == 1
+        assert len(standby_queue.list_watches()) == 0
+
+    def test_keeps_recent_terminal_watches(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        standby_queue.cancel_watch(watch["id"])
+        removed = standby_queue.clear_old_watches(keep_days=14)
+        assert removed == 0
+        assert len(standby_queue.list_watches()) == 1
+
+    def test_keeps_active_watches_regardless_of_age(self):
+        standby_queue.add_watch(["saturday"], "morning", 4)
+        with standby_queue._locked_file(standby_queue.QUEUE_FILE, "r+") as f:
+            data = standby_queue._load(f)
+            data["watches"][0]["created_at"] = "2020-01-01T00:00:00"
+            standby_queue._save(f, data)
+        removed = standby_queue.clear_old_watches(keep_days=14)
+        assert removed == 0
