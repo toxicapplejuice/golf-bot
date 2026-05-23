@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import smtplib
 import sys
@@ -22,7 +23,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout, Error as PlaywrightError
 
 try:
     from playwright_stealth import stealth_sync
@@ -752,6 +753,15 @@ def login_with_retry(page, queue_mode: str = "timeout") -> bool:
 # ======================================================================
 
 MAX_NAV_RECOVERY_ATTEMPTS = 3
+NAV_TIMEOUT_NORMAL = 30000
+NAV_TIMEOUT_RUSH = 12000
+
+_rush_mode = False
+
+
+def set_rush_mode(enabled: bool) -> None:
+    global _rush_mode
+    _rush_mode = enabled
 
 
 def navigate_to_search(page, url: str) -> bool:
@@ -764,11 +774,13 @@ def navigate_to_search(page, url: str) -> bool:
     Loops up to MAX_NAV_RECOVERY_ATTEMPTS times to handle chained failures
     (e.g. Queue-it wait -> session expired -> Queue-it again).
     """
+    nav_timeout = NAV_TIMEOUT_RUSH if _rush_mode else NAV_TIMEOUT_NORMAL
     for attempt in range(1, MAX_NAV_RECOVERY_ATTEMPTS + 1):
         try:
-            page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        except PlaywrightTimeout:
-            print(f"  [nav] goto timed out (attempt {attempt})")
+            page.goto(url, timeout=nav_timeout, wait_until="domcontentloaded")
+        except (PlaywrightTimeout, PlaywrightError) as e:
+            label = "goto timed out" if isinstance(e, PlaywrightTimeout) else f"goto failed ({type(e).__name__})"
+            print(f"  [nav] {label} (attempt {attempt})")
             if attempt < MAX_NAV_RECOVERY_ATTEMPTS:
                 continue
             return False
@@ -1308,6 +1320,9 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
 
     for pass_label, max_hour in passes:
         print(f"\n  === {day_name.upper()} / {pass_label} pass (until {max_hour}:00) ===")
+        courses = list(COURSE_CODES.items())
+        random.shuffle(courses)
+        print(f"  Course order: {', '.join(name for _, name in courses)}")
         for round_num in range(1, MAX_SEARCH_ROUNDS_PER_PASS + 1):
             print(f"  Round {round_num}/{MAX_SEARCH_ROUNDS_PER_PASS}")
             # Poll shared state between rounds too — sibling accounts may have
@@ -1319,7 +1334,7 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
                 if is_full:
                     print(f"  [coord] {day_name} hit capacity ({', '.join(booked_by_list)}) — stopping")
                     return {"success": False, "details": None, "course": None, "skipped": True}
-            for course_code, course_name in COURSE_CODES.items():
+            for course_code, course_name in courses:
                 if exclude_course and course_name == exclude_course:
                     continue
                 result = search_and_book_course(
@@ -1373,6 +1388,9 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
 
     if not skip_wait:
         wait_until_release_time()
+
+    set_rush_mode(True)
+    print("  [rush] Rush mode ON — 12s nav timeout for initial burst")
 
     # After waking up at 8:00 PM, verify we're still logged in before searching
     if not is_authenticated(page):
@@ -1433,6 +1451,11 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
             )
 
     book_day("saturday", saturday_date, "saturday")
+
+    if _rush_mode:
+        set_rush_mode(False)
+        print("  [rush] Rush mode OFF — switching to normal 30s nav timeout")
+
     book_day("sunday", sunday_date, "sunday",
              exclude_course=course_of(results["saturday"]))
 
