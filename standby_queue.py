@@ -20,12 +20,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 QUEUE_FILE = os.path.join(SCRIPT_DIR, "standby_queue.json")
 
 TIME_PREF_RANGES = {
-    "morning": (8, 13),
-    "afternoon": (13, 17),
-    "all": (8, 17),
+    "morning": (420, 660),     # 7:00 AM – 11:00 AM
+    "afternoon": (780, 1020),  # 1:00 PM – 5:00 PM
+    "all": (480, 1020),        # 8:00 AM – 5:00 PM
 }
 
-VALID_DAYS = ("saturday", "sunday")
+VALID_DAYS = ("friday", "saturday", "sunday")
 VALID_TIME_PREFS = tuple(TIME_PREF_RANGES.keys())
 
 
@@ -70,15 +70,17 @@ def _save(f, data: dict) -> None:
     json.dump(data, f, indent=2)
 
 
-def get_upcoming_weekend_dates() -> tuple[str, str]:
-    """Return (saturday_date, sunday_date) for the upcoming weekend.
+def get_upcoming_weekend_dates() -> tuple[str, str, str]:
+    """Return (friday_date, saturday_date, sunday_date) for the upcoming weekend.
 
     Unlike bot.get_next_weekend_dates(), this includes today if it IS
-    Saturday or Sunday — standby watches should target the current weekend.
+    Friday/Saturday/Sunday — standby watches should target the current weekend.
     """
     today = datetime.now()
     weekday = today.weekday()
-    if weekday == 5:  # Saturday
+    if weekday == 4:  # Friday
+        saturday = today + timedelta(days=1)
+    elif weekday == 5:  # Saturday
         saturday = today
     elif weekday == 6:  # Sunday
         saturday = today - timedelta(days=1)
@@ -87,8 +89,13 @@ def get_upcoming_weekend_dates() -> tuple[str, str]:
         if days_until == 0:
             days_until = 7
         saturday = today + timedelta(days=days_until)
+    friday = saturday - timedelta(days=1)
     sunday = saturday + timedelta(days=1)
-    return saturday.strftime("%-m/%d/%Y"), sunday.strftime("%-m/%d/%Y")
+    return (
+        friday.strftime("%-m/%d/%Y"),
+        saturday.strftime("%-m/%d/%Y"),
+        sunday.strftime("%-m/%d/%Y"),
+    )
 
 
 def _compute_expiry(sunday_date_str: str) -> str:
@@ -107,11 +114,12 @@ def add_watch(days: list[str], time_pref: str, players: int) -> dict:
     if not 1 <= players <= 4:
         raise ValueError(f"Invalid players: {players} (must be 1-4)")
 
-    sat_date, sun_date = get_upcoming_weekend_dates()
+    fri_date, sat_date, sun_date = get_upcoming_weekend_dates()
+    date_map = {"friday": fri_date, "saturday": sat_date, "sunday": sun_date}
     target_dates = {}
     results = {}
     for d in days:
-        target_dates[d] = sat_date if d == "saturday" else sun_date
+        target_dates[d] = date_map[d]
         results[d] = None
 
     watch = {
