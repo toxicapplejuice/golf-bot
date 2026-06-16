@@ -175,20 +175,30 @@ class TestChooseBlock:
         assert chosen["course_name"] == "Roy Kizer"
         assert chosen["kind"] == "consecutive"
 
-    def test_course_priority_dominates_time(self):
-        # Jimmy Clay is listed first (higher priority). Even though Roy Kizer's
-        # block is earlier, the preferred course wins by default.
+    def test_earliest_block_across_courses_wins(self):
+        # Jimmy Clay is listed first, but Roy Kizer has the earlier block — the
+        # earliest block wins across courses (course order is only a tiebreaker).
         course_slots = {
             ("1", "Jimmy Clay"): [_slot("9:00 AM"), _slot("9:08 AM"), _slot("9:16 AM")],
             ("2", "Roy Kizer"): [_slot("8:00 AM"), _slot("8:08 AM"), _slot("8:16 AM")],
         }
         chosen = choose_block(course_slots, n=3)
-        assert chosen["course_name"] == "Jimmy Clay"
-        assert _times(chosen["block"]) == ["9:00 AM", "9:08 AM", "9:16 AM"]
+        assert chosen["course_name"] == "Roy Kizer"
+        assert _times(chosen["block"]) == ["8:00 AM", "8:08 AM", "8:16 AM"]
 
-    def test_consecutive_beats_higher_priority_tight(self):
-        # Jimmy Clay (higher priority) only has a scattered/tight block; Roy
-        # Kizer has a clean consecutive one. Consecutiveness wins over course.
+    def test_course_order_breaks_time_ties(self):
+        # Two courses with equally-early blocks -> the higher-priority course
+        # (listed first) wins the tie.
+        course_slots = {
+            ("1", "Jimmy Clay"): [_slot("8:00 AM"), _slot("8:08 AM"), _slot("8:16 AM")],
+            ("2", "Roy Kizer"): [_slot("8:00 AM"), _slot("8:08 AM"), _slot("8:16 AM")],
+        }
+        chosen = choose_block(course_slots, n=3)
+        assert chosen["course_name"] == "Jimmy Clay"
+
+    def test_consecutive_beats_tight_even_if_later(self):
+        # Jimmy Clay has only a scattered/tight block; Roy Kizer has a clean
+        # consecutive one (later). Consecutiveness wins over earliest time.
         course_slots = {
             ("1", "Jimmy Clay"): [_slot("8:00 AM"), _slot("8:14 AM"), _slot("8:28 AM")],
             ("2", "Roy Kizer"): [_slot("9:00 AM"), _slot("9:08 AM"), _slot("9:16 AM")],
@@ -197,9 +207,8 @@ class TestChooseBlock:
         assert chosen["course_name"] == "Roy Kizer"
         assert chosen["kind"] == "consecutive"
 
-    def test_prefer_overrides_course_priority(self):
-        # With an explicit --prefer target, closeness to it beats course order:
-        # Jimmy Clay is higher priority but Roy Kizer sits on the target.
+    def test_prefer_picks_block_closest_to_target(self):
+        # An explicit --prefer target selects the block closest to it.
         course_slots = {
             ("1", "Jimmy Clay"): [_slot("8:00 AM"), _slot("8:08 AM"), _slot("8:16 AM")],
             ("2", "Roy Kizer"): [_slot("10:00 AM"), _slot("10:08 AM"), _slot("10:16 AM")],

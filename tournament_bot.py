@@ -211,9 +211,8 @@ def choose_block(course_slots: dict[tuple[str, str], list[dict]],
     """Pick the best block across courses.
 
     Preference order: a clean consecutive block beats a merely-tight one; within
-    a tier, course priority (the --courses order) wins, and the earliest tee time
-    breaks ties within a course. An explicit prefer_min flips this so closeness to
-    the target time outranks course order. If no course yields n slots, fall back
+    a tier, the earliest block wins (or closest to prefer_min when set), and the
+    --courses order only breaks exact ties. If no course yields n slots, fall back
     to the best PARTIAL (the course with the most available slots, earliest).
 
     Returns {course_code, course_name, block, kind} where kind is
@@ -224,12 +223,10 @@ def choose_block(course_slots: dict[tuple[str, str], list[dict]],
 
     def rank(block: list[dict], tier: int, course_idx: int) -> tuple:
         start = start_min(block)
-        if prefer_min is not None:
-            # An explicit --prefer target takes precedence over course order.
-            return (tier, abs(start - prefer_min), course_idx, start)
-        # Default: course priority (the --courses order) dominates; earliest tee
-        # time within the preferred course breaks ties.
-        return (tier, course_idx, start)
+        closeness = abs(start - prefer_min) if prefer_min is not None else start
+        # Earliest block across all courses wins (or closest to --prefer when
+        # set); the --courses order only breaks exact ties.
+        return (tier, closeness, start, course_idx)
 
     candidates: list[tuple[tuple, str, str, list[dict], str]] = []
     for course_idx, ((code, name), slots) in enumerate(course_slots.items()):
