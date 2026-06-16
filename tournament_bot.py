@@ -84,9 +84,10 @@ except ImportError:
 
 from playwright.sync_api import sync_playwright
 
-# Tournament defaults: the two least-contested courses, biggest odds of a clean
-# back-to-back block at the 8 PM rush.
-DEFAULT_COURSES = "Roy Kizer,Jimmy Clay"
+# Tournament course priority (Jimmy Clay > Roy Kizer > Morris Williams). These
+# are the less-contested courses — good odds of a clean back-to-back block at
+# the 8 PM rush — searched in this order.
+DEFAULT_COURSES = "Jimmy Clay,Roy Kizer,Morris Williams"
 TOURNAMENT_SIZE = 3  # consecutive slots wanted (== number of accounts)
 
 # Per account, how many open slots to try before giving up on that account.
@@ -210,9 +211,10 @@ def choose_block(course_slots: dict[tuple[str, str], list[dict]],
     """Pick the best block across courses.
 
     Preference order: a clean consecutive block beats a merely-tight one; within
-    a tier, rank by closeness to prefer_min (or earliest start when prefer_min is
-    None), then by earliest start. If no course yields n slots, fall back to the
-    best PARTIAL (the course with the most available slots, earliest).
+    a tier, course priority (the --courses order) wins, and the earliest tee time
+    breaks ties within a course. An explicit prefer_min flips this so closeness to
+    the target time outranks course order. If no course yields n slots, fall back
+    to the best PARTIAL (the course with the most available slots, earliest).
 
     Returns {course_code, course_name, block, kind} where kind is
     'consecutive' | 'tight' | 'partial', or None if nothing is bookable.
@@ -220,20 +222,24 @@ def choose_block(course_slots: dict[tuple[str, str], list[dict]],
     def start_min(block: list[dict]) -> int:
         return parse_time(block[0]["time"])
 
-    def rank(block: list[dict], tier: int) -> tuple:
+    def rank(block: list[dict], tier: int, course_idx: int) -> tuple:
         start = start_min(block)
-        closeness = abs(start - prefer_min) if prefer_min is not None else start
-        return (tier, closeness, start)
+        if prefer_min is not None:
+            # An explicit --prefer target takes precedence over course order.
+            return (tier, abs(start - prefer_min), course_idx, start)
+        # Default: course priority (the --courses order) dominates; earliest tee
+        # time within the preferred course breaks ties.
+        return (tier, course_idx, start)
 
     candidates: list[tuple[tuple, str, str, list[dict], str]] = []
-    for (code, name), slots in course_slots.items():
+    for course_idx, ((code, name), slots) in enumerate(course_slots.items()):
         block = find_consecutive_block(slots, n, max_gap_min)
         if block:
-            candidates.append((rank(block, 0), code, name, block, "consecutive"))
+            candidates.append((rank(block, 0, course_idx), code, name, block, "consecutive"))
             continue
         block = find_tightest_block(slots, n, max_spread_min)
         if block:
-            candidates.append((rank(block, 1), code, name, block, "tight"))
+            candidates.append((rank(block, 1, course_idx), code, name, block, "tight"))
     if candidates:
         candidates.sort(key=lambda c: c[0])
         _, code, name, block, kind = candidates[0]
@@ -454,7 +460,9 @@ def book_sunday(sessions: list[dict], sunday_date: str, players: int,
     booking per session. Light course diversity by excluding the prior pick.
     """
     results: list[dict] = []
-    exclude: str | None = None
+    # Same course preference as Saturday — Jimmy Clay > Roy Kizer > Morris
+    # Williams. COURSE_CODES is already in that order, so excluding Lions leaves
+    # exactly those three and try_book_day walks them in priority.
     for s in sessions:
         acct = s["acct"]
         if not s["authed"]:
@@ -465,14 +473,13 @@ def book_sunday(sessions: list[dict], sunday_date: str, players: int,
         configure_account_context(acct["id"])
         blacklist: set = set()
         res = try_book_day(page, sunday_date, "sunday", players, blacklist,
-                           exclude_course=exclude, dry_run=dry_run, weekend=None)
+                           exclude_course="Lions", dry_run=dry_run, weekend=None)
         if (not res.get("success") and not res.get("halt_day")
                 and FALLBACK_NUM_PLAYERS and FALLBACK_NUM_PLAYERS < players):
             res = try_book_day(page, sunday_date, "sunday", FALLBACK_NUM_PLAYERS,
-                               blacklist, exclude_course=exclude, dry_run=dry_run,
+                               blacklist, exclude_course="Lions", dry_run=dry_run,
                                weekend=None)
-        if res.get("success") and isinstance(res.get("course"), str):
-            exclude = res["course"]
+        if res.get("success"):
             send_ntfy(f"[{acct['display_name']}] Sunday booked",
                       res.get("details") or "", priority="default",
                       tags="golf,white_check_mark")

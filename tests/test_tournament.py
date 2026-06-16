@@ -175,15 +175,37 @@ class TestChooseBlock:
         assert chosen["course_name"] == "Roy Kizer"
         assert chosen["kind"] == "consecutive"
 
-    def test_both_consecutive_earliest_start_wins(self):
-        # Earlier-start course is listed SECOND to prove it's chosen by time.
+    def test_course_priority_dominates_time(self):
+        # Jimmy Clay is listed first (higher priority). Even though Roy Kizer's
+        # block is earlier, the preferred course wins by default.
         course_slots = {
             ("1", "Jimmy Clay"): [_slot("9:00 AM"), _slot("9:08 AM"), _slot("9:16 AM")],
             ("2", "Roy Kizer"): [_slot("8:00 AM"), _slot("8:08 AM"), _slot("8:16 AM")],
         }
         chosen = choose_block(course_slots, n=3)
+        assert chosen["course_name"] == "Jimmy Clay"
+        assert _times(chosen["block"]) == ["9:00 AM", "9:08 AM", "9:16 AM"]
+
+    def test_consecutive_beats_higher_priority_tight(self):
+        # Jimmy Clay (higher priority) only has a scattered/tight block; Roy
+        # Kizer has a clean consecutive one. Consecutiveness wins over course.
+        course_slots = {
+            ("1", "Jimmy Clay"): [_slot("8:00 AM"), _slot("8:14 AM"), _slot("8:28 AM")],
+            ("2", "Roy Kizer"): [_slot("9:00 AM"), _slot("9:08 AM"), _slot("9:16 AM")],
+        }
+        chosen = choose_block(course_slots, n=3, max_gap_min=10, max_spread_min=30)
         assert chosen["course_name"] == "Roy Kizer"
-        assert _times(chosen["block"]) == ["8:00 AM", "8:08 AM", "8:16 AM"]
+        assert chosen["kind"] == "consecutive"
+
+    def test_prefer_overrides_course_priority(self):
+        # With an explicit --prefer target, closeness to it beats course order:
+        # Jimmy Clay is higher priority but Roy Kizer sits on the target.
+        course_slots = {
+            ("1", "Jimmy Clay"): [_slot("8:00 AM"), _slot("8:08 AM"), _slot("8:16 AM")],
+            ("2", "Roy Kizer"): [_slot("10:00 AM"), _slot("10:08 AM"), _slot("10:16 AM")],
+        }
+        chosen = choose_block(course_slots, n=3, prefer_min=10 * 60)
+        assert chosen["course_name"] == "Roy Kizer"
 
     def test_prefer_min_pulls_toward_target(self):
         course_slots = {
