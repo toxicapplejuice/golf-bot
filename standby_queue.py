@@ -97,8 +97,20 @@ def _compute_expiry(sunday_date_str: str) -> str:
     return sunday.replace(hour=23, minute=59, second=59).isoformat(timespec="seconds")
 
 
-def add_watch(days: list[str], time_pref: str, players: int) -> dict:
-    """Add a new standby watch. Returns the created watch dict."""
+def add_watch(days: list[str], time_pref: str, players: int,
+              min_players: int | None = None,
+              max_hour: int | None = None) -> dict:
+    """Add a new standby watch. Returns the created watch dict.
+
+    min_players sets a floor for the player-count fallback: the check will
+    try every count from players down to min_players, never below. When
+    None, the legacy behavior applies (fall back to FALLBACK_NUM_PLAYERS).
+
+    max_hour caps the end of the time_pref window (24h clock, inclusive
+    hour): morning + max_hour=11 means 8am-11:59am — the bare "morning"
+    pref runs through the 1 o'clock hour, which is how a 1:10 PM slot
+    counts as "morning". When None the pref's full window applies.
+    """
     for d in days:
         if d not in VALID_DAYS:
             raise ValueError(f"Invalid day: {d!r} (must be one of {VALID_DAYS})")
@@ -106,6 +118,15 @@ def add_watch(days: list[str], time_pref: str, players: int) -> dict:
         raise ValueError(f"Invalid time_pref: {time_pref!r} (must be one of {VALID_TIME_PREFS})")
     if not 1 <= players <= 4:
         raise ValueError(f"Invalid players: {players} (must be 1-4)")
+    if min_players is not None and not 1 <= min_players <= players:
+        raise ValueError(
+            f"Invalid min_players: {min_players} (must be 1-{players})")
+    if max_hour is not None:
+        pref_min, _pref_max = TIME_PREF_RANGES[time_pref]
+        if not pref_min <= max_hour <= 23:
+            raise ValueError(
+                f"Invalid max_hour: {max_hour} (must be {pref_min}-23 for "
+                f"{time_pref!r}, or the search window would be empty)")
 
     sat_date, sun_date = get_upcoming_weekend_dates()
     target_dates = {}
@@ -119,6 +140,8 @@ def add_watch(days: list[str], time_pref: str, players: int) -> dict:
         "days": sorted(days),
         "time_pref": time_pref,
         "players": players,
+        "min_players": min_players,
+        "max_hour": max_hour,
         "status": "watching",
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "last_checked_at": None,

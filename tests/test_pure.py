@@ -116,9 +116,9 @@ class TestCourseConfig:
     """Verify course configuration integrity."""
 
     def test_course_codes_order(self):
-        """Courses should be searched in priority order: Lions > Roy Kizer > Jimmy Clay > Morris Williams."""
+        """Courses should be searched in priority order: Jimmy Clay > Roy Kizer > Morris Williams > Lions."""
         names = list(config.COURSE_CODES.values())
-        assert names == ["Lions", "Roy Kizer", "Jimmy Clay", "Morris Williams"]
+        assert names == ["Jimmy Clay", "Roy Kizer", "Morris Williams", "Lions"]
 
     def test_all_course_codes_are_strings(self):
         for code, name in config.COURSE_CODES.items():

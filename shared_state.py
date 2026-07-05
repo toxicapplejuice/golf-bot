@@ -10,12 +10,15 @@ Schema:
   "weekend": "5/2/2026 - 5/3/2026",
   "saturday": {
     "bookings": [
-      {"booked_by": "michael", "details": "8:00 AM at Lions", "booked_at": "..."},
-      {"booked_by": "grant",   "details": "8:08 AM at Lions", "booked_at": "..."}
+      {"booked_by": "michael", "details": "8:00 AM at Jimmy Clay", "course": "Jimmy Clay", "booked_at": "..."},
+      {"booked_by": "grant",   "details": "8:08 AM at Roy Kizer",  "course": "Roy Kizer",  "booked_at": "..."}
     ]
   },
   "sunday": {"bookings": []}
 }
+
+The `course` field powers best-effort cross-account diversity: a sibling
+account reads courses_booked() and skips courses already taken that day.
 
 Uses fcntl.flock() for atomic read-modify-write — safe across processes,
 safe against crashed writers (OS releases the lock on process exit).
@@ -101,10 +104,14 @@ def read_shared(weekend: str) -> dict:
 
 
 def claim_booking(weekend: str, day: str, details: str,
-                  account_id: str) -> tuple[bool, dict]:
+                  account_id: str, course: str = None) -> tuple[bool, dict]:
     """Atomically append a booking for `account_id` to `day`'s list, IF there's
     capacity (len(bookings) < MAX_BOOKINGS_PER_DAY) and the account hasn't
     already booked this day.
+
+    `course` is recorded so sibling accounts can read courses_booked() and
+    avoid double-booking the same course on the same day (best-effort
+    diversity). Optional for backward compatibility.
 
     Returns (claimed, current_state):
         claimed=True  -> booking was recorded
@@ -131,6 +138,7 @@ def claim_booking(weekend: str, day: str, details: str,
         bookings.append({
             "booked_by": account_id,
             "details": details,
+            "course": course,
             "booked_at": datetime.now().isoformat(timespec="seconds"),
         })
 
@@ -150,6 +158,19 @@ def day_already_booked(weekend: str, day: str) -> tuple[bool, list]:
     bookings = entry.get("bookings", []) or []
     is_full = len(bookings) >= MAX_BOOKINGS_PER_DAY
     return is_full, [b.get("booked_by") for b in bookings if b.get("booked_by")]
+
+
+def courses_booked(weekend: str, day: str) -> set:
+    """Return the set of course names already booked for `day` this weekend.
+
+    Powers best-effort cross-account course diversity: a sibling account skips
+    courses that are already taken today. Bookings without a recorded course
+    (legacy entries / None) are ignored, degrading safely to no exclusion.
+    """
+    state = read_shared(weekend)
+    entry = state.get(day) or {}
+    bookings = entry.get("bookings", []) or []
+    return {b["course"] for b in bookings if b.get("course")}
 
 
 def clear_shared_state() -> None:

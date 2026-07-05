@@ -454,6 +454,72 @@ def append_to_history(saturday_date: str, sunday_date: str, results: dict,
         print(f"  [history] Save failed: {e}")
 
 
+def _booking_matches(booking: dict, account_id: str, time: str, course) -> bool:
+    """True if a history booking dict matches the holding account + slot.
+
+    Matches on the stored ``details`` string (e.g. "8:40 AM at Jimmy Clay"),
+    which carries both time and course, so this works for legacy multi-bot
+    sub-bookings that predate the explicit ``course`` field.
+    """
+    if booking.get("booked_by") != account_id:
+        return False
+    details = booking.get("details") or ""
+    if time not in details:
+        return False
+    if course and course not in details:
+        return False
+    return True
+
+
+def mark_booking_cancelled(account_id: str, date: str, time: str, course,
+                           history_file: str = None) -> bool:
+    """Flag a booking as cancelled in history.json. Returns True if one matched.
+
+    Handles both history shapes:
+      - single-account: the day dict itself carries booked_by/details/course
+      - multi-bot: the day dict has a 'bookings' list of per-account entries
+
+    ``account_id`` is the holding account (the booking's ``booked_by``). All
+    matching bookings across every history entry for that date are flagged, so
+    a re-booked weekend with duplicate entries stays consistent.
+    """
+    path = history_file or HISTORY_FILE
+    try:
+        with open(path, "r") as f:
+            history = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+
+    cancelled_at = datetime.now().isoformat(timespec="seconds")
+    changed = False
+
+    for entry in history:
+        results = entry.get("results", {})
+        for day_key in ("saturday", "sunday"):
+            day = results.get(day_key)
+            if not isinstance(day, dict):
+                continue
+            if entry.get(f"{day_key}_date") != date:
+                continue
+            subs = day.get("bookings")
+            targets = subs if isinstance(subs, list) and subs else [day]
+            for booking in targets:
+                if _booking_matches(booking, account_id, time, course) \
+                        and not booking.get("cancelled"):
+                    booking["cancelled"] = True
+                    booking["cancelled_at"] = cancelled_at
+                    changed = True
+
+    if changed:
+        try:
+            with open(path, "w") as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            print(f"  [history] cancel-mark save failed: {e}")
+            return False
+    return changed
+
+
 # ======================================================================
 # Pure helpers (dates, times, priorities)
 # ======================================================================
@@ -799,14 +865,15 @@ def navigate_to_search(page, url: str) -> bool:
 # Search URL + slot extraction
 # ======================================================================
 
-def build_search_url(course_code: str, date: str, num_players: int) -> str:
+def build_search_url(course_code: str, date: str, num_players: int,
+                     holes: int = 18) -> str:
     return (
         f"{SEARCH_URL}"
         f"&secondarycode={course_code}"
         f"&begindate={date}"
         f"&begintime=07:00 am"
         f"&numberofplayers={num_players}"
-        f"&numberofholes=18"
+        f"&numberofholes={holes}"
         f"&Action=Start"
     )
 
@@ -896,6 +963,15 @@ BOOKED_TEXT_MARKERS = (
     "thank you for your reservation", "tee time confirmation",
 )
 
+# Cart-page finish control — shared by the booking flow and cancel_bot's
+# cancellation cart (which routes through the same addtocart.html checkout).
+ONE_CLICK_FINISH_SELECTORS = (
+    "button:has-text('One Click')",
+    "a:has-text('One Click')",
+    "input[value*='One Click']",
+    "#oneclickfinish",
+)
+
 # Reservation history page — used for post-booking verification
 HISTORY_URL = f"{BASE_URL}/history.html?historyoption=inquiry"
 
@@ -933,47 +1009,96 @@ def verify_booking_on_page(page, slot: dict, page_text: str) -> bool:
     return time_found and course_found
 
 
-def verify_booking_via_history(page, slot: dict) -> bool:
-    """Definitive verification: navigate to reservation history page and look for slot.
+def _slot_in_content(content: str, slot: dict) -> bool:
+    """Pure: does reservation-history page content reference this slot?
 
-    This is the ground-truth check — if the booking doesn't appear here, it didn't happen.
+    Matches date AND time AND course, tolerating the site's formatting quirks:
+      - date may be zero-padded ("04/25/2026") or not ("4/25/2026")
+      - time may be condensed ("8:01A") instead of full ("8:01 AM")
+
+    Kept pure (no I/O) so it can be unit-tested and reused by both the
+    booking-success check and the cancellation verify-gone check.
+    """
+    content = content.lower()
+
+    date_str = slot["date"]  # e.g. "4/25/2026"
+    date_parts = date_str.split("/")
+    date_padded = f"{date_parts[0].zfill(2)}/{date_parts[1].zfill(2)}/{date_parts[2]}"
+    date_found = date_str in content or date_padded in content
+
+    time_lower = slot["time"].lower()
+    time_condensed = slot["time"].replace(" AM", "A").replace(" PM", "P").lower()
+    time_found = time_lower in content or time_condensed in content
+
+    course_found = slot["course"].lower() in content
+
+    return date_found and time_found and course_found
+
+
+def _active_slot_in_content(content: str, slot: dict) -> bool:
+    """Pure: is there an ACTIVE (Status 'Reserved') history row for this slot?
+
+    A cancelled reservation is NOT removed from the WebTrac history table — its
+    Status cell merely flips from 'Reserved' to 'Cancelled' (old cancelled rows
+    keep showing the same date/time/course text). So the flat _slot_in_content
+    check can't tell a live booking from a cancelled one, and a cancellation
+    verify-gone built on it would forever report "still present". This splits
+    the page into <tr> rows and requires a slot-matching row whose Status cell
+    still reads 'Reserved'.
+    """
+    lowered = content.lower()
+    for row in re.split(r"(?=<tr[\s>])", lowered):
+        if _slot_in_content(row, slot) and re.search(
+            r'data-title="status">\s*reserved', row
+        ):
+            return True
+    return False
+
+
+def _fetch_history_content(page):
+    """Navigate to the reservation history page and return its lowercased HTML.
+
+    Returns None if the page can't be loaded or the session was lost — callers
+    that must distinguish "slot absent" from "couldn't check" (e.g. cancel
+    verification) should branch on None explicitly rather than treating a fetch
+    failure as "slot gone".
     """
     try:
         page.goto(HISTORY_URL, timeout=15000, wait_until="domcontentloaded")
     except PlaywrightTimeout:
-        print(f"    [verify] History page timeout — assuming booking failed")
-        return False
-
-    # If we got redirected to login or queue, something's wrong
+        print("    [verify] History page timeout")
+        return None
     if is_on_login_page(page) or is_in_queue(page):
-        print(f"    [verify] Lost session during verification — assuming booking failed")
-        return False
-
+        print("    [verify] Lost session while loading history")
+        return None
     try:
-        content = page.content().lower()
+        return page.content().lower()
     except Exception:
+        return None
+
+
+def slot_in_history(page, slot: dict) -> bool:
+    """Navigate to reservation history and return True iff the slot appears.
+
+    Returns False both when the slot is genuinely absent AND when the history
+    page can't be loaded. Booking verification wants exactly that (a failed
+    check must never read as "booked"). Cancellation needs the finer
+    distinction and should call _fetch_history_content/_slot_in_content.
+    """
+    content = _fetch_history_content(page)
+    if content is None:
         return False
+    present = _slot_in_content(content, slot)
+    print(f"    [verify] history check — slot {'present' if present else 'absent'}")
+    return present
 
-    # Look for slot time, course, and date
-    time_lower = slot["time"].lower()
-    course_lower = slot["course"].lower()
-    date_str = slot["date"]  # e.g. "4/25/2026"
 
-    # Normalize date variations: site might show "04/25/2026" or "4/25/2026"
-    date_parts = date_str.split("/")
-    date_padded = f"{date_parts[0].zfill(2)}/{date_parts[1].zfill(2)}/{date_parts[2]}"
+def verify_booking_via_history(page, slot: dict) -> bool:
+    """Definitive booking verification — the slot must appear in history.
 
-    date_found = date_str in content or date_padded in content
-    time_found = time_lower in content
-
-    # Time on receipt can be "8:01A" instead of "8:01 AM" — also check condensed form
-    time_condensed = slot["time"].replace(" AM", "A").replace(" PM", "P").lower()
-    time_found = time_found or time_condensed in content
-
-    course_found = course_lower in content
-
-    print(f"    [verify] history check — date:{date_found} time:{time_found} course:{course_found}")
-    return date_found and time_found and course_found
+    Ground-truth check: if the booking doesn't appear here, it didn't happen.
+    """
+    return slot_in_history(page, slot)
 
 
 def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
@@ -1048,12 +1173,7 @@ def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
 
     # We should be on addtocart.html now — click "One Click Finish" to complete
     clicked_finish = False
-    for sel in (
-        "button:has-text('One Click')",
-        "a:has-text('One Click')",
-        "input[value*='One Click']",
-        "#oneclickfinish",
-    ):
+    for sel in ONE_CLICK_FINISH_SELECTORS:
         try:
             btn = page.locator(sel).first
             if btn.count() > 0 and btn.is_visible():
@@ -1189,6 +1309,7 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
                 if weekend and day_name:
                     claimed, cur_state = shared_state.claim_booking(
                         weekend, day_name, details, ACCOUNT_ID,
+                        course=course_name,
                     )
                     if not claimed:
                         # Day was already at MAX bookings when we tried to claim,
@@ -1310,6 +1431,13 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
         print(f"\n  === {day_name.upper()} / {pass_label} pass (until {max_hour}:00) ===")
         for round_num in range(1, MAX_SEARCH_ROUNDS_PER_PASS + 1):
             print(f"  Round {round_num}/{MAX_SEARCH_ROUNDS_PER_PASS}")
+            # Courses to skip this round: the per-account Saturday->Sunday
+            # exclusion, plus any course a sibling account has already booked
+            # today (best-effort cross-account diversity). Re-read every round
+            # so a sibling's just-claimed course is honored as soon as it lands.
+            excluded_courses = set()
+            if exclude_course:
+                excluded_courses.add(exclude_course)
             # Poll shared state between rounds too — sibling accounts may have
             # filled the day to capacity while we were searching this course.
             if weekend:
@@ -1319,8 +1447,13 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
                 if is_full:
                     print(f"  [coord] {day_name} hit capacity ({', '.join(booked_by_list)}) — stopping")
                     return {"success": False, "details": None, "course": None, "skipped": True}
+                sibling_courses = shared_state.courses_booked(weekend, day_name)
+                if sibling_courses:
+                    excluded_courses |= sibling_courses
+                    print(f"  [coord] {day_name}: avoiding course(s) already "
+                          f"booked today — {', '.join(sorted(sibling_courses))}")
             for course_code, course_name in COURSE_CODES.items():
-                if exclude_course and course_name == exclude_course:
+                if course_name in excluded_courses:
                     continue
                 result = search_and_book_course(
                     page, course_code, course_name, date, num_players,

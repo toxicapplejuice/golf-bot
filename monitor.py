@@ -11,8 +11,11 @@ Then open: http://localhost:8111
 import http.server
 import json
 import os
+import subprocess
+import sys
 from datetime import datetime, timedelta
 
+import cancel_queue
 import standby_queue
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -278,6 +281,15 @@ HTML = """<!DOCTYPE html>
     flex-shrink: 0;
   }
   .cancel-btn:hover { color: var(--danger); border-color: var(--danger); }
+  .booking-chip {
+    display: flex; align-items: center; gap: 8px; padding: 2px 0; flex-wrap: wrap;
+  }
+  .booking-cancelled { color: var(--text-subtle); text-decoration: line-through; }
+  .cancel-jobs { display: flex; flex-direction: column; gap: 6px; padding: 0 16px 12px; }
+  .cancel-job {
+    font-size: 12px; color: var(--text-muted);
+    display: flex; align-items: center; gap: 8px;
+  }
 </style>
 </head>
 <body>
@@ -345,6 +357,7 @@ HTML = """<!DOCTYPE html>
       <span class="history-title">Run history</span>
       <span class="history-meta" id="historyCount">0 runs</span>
     </div>
+    <div class="cancel-jobs" id="cancelJobs"></div>
     <div id="historyBody">
       <div class="empty-state">No past runs recorded yet.</div>
     </div>
@@ -625,10 +638,72 @@ function tickNextRun() {
   el.textContent = nextRunSeconds <= 0 ? 'now' : formatDuration(nextRunSeconds);
 }
 
+// Cancel payloads are stashed by index so the Cancel button's onclick only
+// has to carry an integer — no string-escaping of slot text into HTML.
+let cancelPayloads = [];
+
+function parseSlotDate(s) {
+  const m = /^(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})$/.exec((s || '').trim());
+  if (!m) return null;
+  return new Date(parseInt(m[3]), parseInt(m[1]) - 1, parseInt(m[2]));
+}
+function isFutureOrToday(dateStr) {
+  const d = parseSlotDate(dateStr);
+  if (!d) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return d >= today;
+}
+
+function bookingsForDay(entry, dayKey) {
+  const day = entry.results && entry.results[dayKey];
+  if (!day || !day.success) return [];
+  if (Array.isArray(day.bookings) && day.bookings.length) {
+    return day.bookings.map(b => ({
+      booked_by: b.booked_by, details: b.details,
+      course: b.course || null, cancelled: !!b.cancelled,
+    }));
+  }
+  return [{
+    booked_by: day.booked_by || entry.account_id, details: day.details,
+    course: day.course || null, cancelled: !!day.cancelled,
+  }];
+}
+
+function renderDayCell(entry, dayKey) {
+  const day = entry.results && entry.results[dayKey];
+  if (!day || !day.success) {
+    return '<span style="color:var(--danger)">✗</span> No booking';
+  }
+  const dateStr = dayKey === 'saturday' ? entry.saturday_date : entry.sunday_date;
+  let out = '';
+  for (const b of bookingsForDay(entry, dayKey)) {
+    out += '<div class="booking-chip">';
+    if (b.cancelled) {
+      out += '<span class="booking-cancelled">' + escapeHtml(b.details || '') + '</span>'
+           + '<span class="badge danger">Cancelled</span>';
+    } else {
+      out += '<span style="color:var(--success)">✓</span> ' + escapeHtml(b.details || '');
+      if (isFutureOrToday(dateStr) && b.booked_by) {
+        const time = (b.details || '').split(' at ')[0];
+        const idx = cancelPayloads.length;
+        cancelPayloads.push({
+          account_id: b.booked_by, date: dateStr, day: dayKey,
+          time: time, course: b.course, details: b.details,
+        });
+        out += ' <button class="cancel-btn" onclick="cancelBooking(' + idx + ')">Cancel</button>';
+      }
+    }
+    out += '</div>';
+  }
+  return out;
+}
+
 function renderHistory(entries) {
   const body = document.getElementById('historyBody');
   const count = document.getElementById('historyCount');
   count.textContent = entries.length + (entries.length === 1 ? ' run' : ' runs');
+  cancelPayloads = [];
   if (!entries.length) {
     body.innerHTML = '<div class="empty-state">No past runs recorded yet.</div>';
     return;
@@ -645,8 +720,6 @@ function renderHistory(entries) {
     const sun = e.results?.sunday;
     const satOk = !!sat?.success;
     const sunOk = !!sun?.success;
-    const satText = satOk ? sat.details : 'No booking';
-    const sunText = sunOk ? sun.details : 'No booking';
     let overall, cls;
     if (satOk && sunOk) { overall = 'Success'; cls = 'success'; }
     else if (satOk || sunOk) { overall = 'Partial'; cls = 'warning'; }
@@ -658,8 +731,8 @@ function renderHistory(entries) {
     html += '<tr>';
     html += '<td class="muted">' + escapeHtml(formatTimestamp(e.run_started)) + '</td>';
     html += '<td><span class="badge ' + cls + '"><span class="badge-dot"></span>' + overall + '</span></td>';
-    html += '<td>' + (satOk ? '<span style="color:var(--success)">✓</span> ' : '<span style="color:var(--danger)">✗</span> ') + escapeHtml(satText) + '</td>';
-    html += '<td>' + (sunOk ? '<span style="color:var(--success)">✓</span> ' : '<span style="color:var(--danger)">✗</span> ') + escapeHtml(sunText) + '</td>';
+    html += '<td>' + renderDayCell(e, 'saturday') + '</td>';
+    html += '<td>' + renderDayCell(e, 'sunday') + '</td>';
     html += '<td class="muted">' + escapeHtml(bookedBy) + '</td>';
     html += '</tr>';
   }
@@ -672,6 +745,100 @@ async function refreshHistory() {
     const resp = await fetch('/api/history');
     const entries = await resp.json();
     renderHistory(entries);
+  } catch (e) {}
+}
+
+// Booking cancellation
+async function cancelBooking(idx) {
+  const p = cancelPayloads[idx];
+  if (!p) return;
+  const msg = 'Cancel this tee time?\n\n' + p.details + ' on ' + p.date
+            + ' (' + p.account_id + ')\n\nThis is permanent and cannot be undone.\n\n'
+            + 'Enter the confirmation number from your WebTrac booking email:';
+  const conf = prompt(msg);
+  if (conf === null) return;  // user dismissed — abort, no cancel
+  if (!conf.trim()) { alert('A confirmation number is required to cancel.'); return; }
+  const payload = Object.assign({}, p, {confirmation_number: conf.trim()});
+  try {
+    const resp = await fetch('/api/booking/cancel', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const job = await resp.json();
+    if (resp.ok && job.id) {
+      refreshCancelJobs();
+      pollCancelJob(job.id);
+    } else {
+      alert('Cancel failed: ' + (job.error || 'unknown error'));
+    }
+  } catch (e) {
+    alert('Cancel request failed: ' + e);
+  }
+}
+
+let cancelPollTimers = {};
+function pollCancelJob(id) {
+  if (cancelPollTimers[id]) return;
+  let tries = 0;
+  cancelPollTimers[id] = setInterval(async () => {
+    tries++;
+    let done = false;
+    try {
+      const resp = await fetch('/api/cancel/jobs');
+      const jobs = await resp.json();
+      renderCancelJobs(jobs);
+      const job = jobs.find(j => j.id === id);
+      if (job && (job.status === 'done' || job.status === 'failed')) {
+        done = true;
+        refreshHistory();
+      }
+    } catch (e) {}
+    if (done || tries > 90) {  // ~3 min cap at 2s polls
+      clearInterval(cancelPollTimers[id]);
+      delete cancelPollTimers[id];
+    }
+  }, 2000);
+}
+
+function renderCancelJobs(jobs) {
+  const box = document.getElementById('cancelJobs');
+  if (!box) return;
+  const now = Date.now();
+  const recent = (jobs || []).filter(j => {
+    if (j.status === 'pending' || j.status === 'running') return true;
+    const t = Date.parse(j.finished_at || '');
+    return !isNaN(t) && (now - t) < 10 * 60 * 1000;
+  });
+  if (!recent.length) { box.innerHTML = ''; return; }
+  let html = '';
+  for (const j of recent) {
+    let cls, label;
+    if (j.status === 'done') {
+      cls = (j.result === 'cancelled') ? 'success' : 'warning';
+      label = j.result || 'done';
+    } else if (j.status === 'failed') {
+      cls = 'danger'; label = j.result || 'failed';
+    } else if (j.status === 'running') {
+      cls = 'warning'; label = 'cancelling…';
+    } else {
+      cls = 'warning'; label = 'queued';
+    }
+    html += '<div class="cancel-job">'
+      + '<span class="badge ' + cls + '"><span class="badge-dot"></span>'
+      + escapeHtml(label) + '</span> '
+      + escapeHtml((j.account_name || j.account_id || '') + ': '
+                   + (j.details || '') + ' on ' + (j.date || ''))
+      + '</div>';
+  }
+  box.innerHTML = html;
+}
+
+async function refreshCancelJobs() {
+  try {
+    const resp = await fetch('/api/cancel/jobs');
+    const jobs = await resp.json();
+    renderCancelJobs(jobs);
   } catch (e) {}
 }
 
@@ -772,6 +939,7 @@ setInterval(refreshHistory, 10000);
 setInterval(tickNextRun, 1000);
 setInterval(refreshNextRun, 60000);
 setInterval(refreshStandby, 10000);
+setInterval(refreshCancelJobs, 5000);
 
 (async () => {
   await refreshAccounts();
@@ -780,10 +948,35 @@ setInterval(refreshStandby, 10000);
   refreshHistory();
   refreshNextRun();
   refreshStandby();
+  refreshCancelJobs();
 })();
 </script>
 </body>
 </html>"""
+
+
+def _account_display_name(account_id: str) -> str:
+    for acc in load_accounts():
+        if acc["id"] == account_id:
+            return acc["display_name"]
+    return account_id.capitalize()
+
+
+def _spawn_cancel_runner(job_id: str) -> None:
+    """Spawn cancel_bot.py to execute a queued cancellation, fully detached."""
+    log_path = os.path.join(SCRIPT_DIR, f"cancel_{job_id}.log")
+    log_handle = open(log_path, "w", buffering=1)
+    try:
+        subprocess.Popen(
+            [sys.executable, "-u", os.path.join(SCRIPT_DIR, "cancel_bot.py"),
+             "run", "--job", job_id],
+            stdout=log_handle, stderr=subprocess.STDOUT,
+            cwd=SCRIPT_DIR, start_new_session=True,
+        )
+    finally:
+        # Child inherited its own fd; close the parent copy so the long-lived
+        # server doesn't leak a descriptor per cancellation.
+        log_handle.close()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -846,6 +1039,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             standby_queue.expire_stale_watches()
             self._json(standby_queue.list_watches())
 
+        elif path == "/api/cancel/jobs":
+            self._json(cancel_queue.list_jobs())
+
         elif path == "/api/history":
             try:
                 with open(HISTORY_FILE, "r") as f:
@@ -875,6 +1071,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     days=data["days"],
                     time_pref=data.get("time_pref", "morning"),
                     players=data.get("players", 4),
+                    min_players=data.get("min_players"),
+                    max_hour=data.get("max_hour"),
                 )
                 self._json(watch)
             except (json.JSONDecodeError, ValueError, KeyError) as e:
@@ -890,6 +1088,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._json_error("Watch not found or not active", 404)
             else:
                 self._json_error("Invalid path", 400)
+
+        elif path == "/api/booking/cancel":
+            try:
+                data = json.loads(body)
+                account_id = (data.get("account_id") or "").strip()
+                date = (data.get("date") or "").strip()
+                day = (data.get("day") or "").strip()
+                time = (data.get("time") or "").strip()
+                course = data.get("course") or None
+                confirmation_number = (data.get("confirmation_number") or "").strip()
+                details = data.get("details") or (
+                    f"{time} at {course}" if course else time)
+                dry_run = bool(data.get("dry_run"))
+                if not account_id or not date or not time \
+                        or day not in ("saturday", "sunday"):
+                    self._json_error(
+                        "Missing/invalid account_id, date, day, or time", 400)
+                    return
+                if not confirmation_number:
+                    self._json_error(
+                        "A confirmation number is required to cancel", 400)
+                    return
+                # Dup-spawn guard: a double-click must not fire two cancels.
+                existing = cancel_queue.find_active_for(
+                    account_id, date, time, course)
+                if existing:
+                    self._json(existing)
+                    return
+                job = cancel_queue.add_job(
+                    account_id=account_id,
+                    account_name=_account_display_name(account_id),
+                    date=date, day=day, time=time, course=course,
+                    details=details, confirmation_number=confirmation_number,
+                    dry_run=dry_run,
+                )
+                _spawn_cancel_runner(job["id"])
+                self._json(job)
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                self._json_error(str(e), 400)
 
         else:
             self.send_response(404)

@@ -135,6 +135,58 @@ class TestAddWatch:
         except ValueError:
             pass
 
+    def test_min_players_defaults_to_none(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        assert watch["min_players"] is None
+
+    def test_min_players_stored(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4,
+                                        min_players=3)
+        assert watch["min_players"] == 3
+
+    def test_min_players_equal_to_players_ok(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 3,
+                                        min_players=3)
+        assert watch["min_players"] == 3
+
+    def test_min_players_above_players_raises(self):
+        try:
+            standby_queue.add_watch(["saturday"], "morning", 2, min_players=3)
+            assert False, "Expected ValueError"
+        except ValueError as e:
+            assert "min_players" in str(e)
+
+    def test_min_players_below_one_raises(self):
+        try:
+            standby_queue.add_watch(["saturday"], "morning", 4, min_players=0)
+            assert False, "Expected ValueError"
+        except ValueError as e:
+            assert "min_players" in str(e)
+
+    def test_max_hour_defaults_to_none(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        assert watch["max_hour"] is None
+
+    def test_max_hour_stored(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4,
+                                        max_hour=11)
+        assert watch["max_hour"] == 11
+
+    def test_max_hour_below_pref_min_raises(self):
+        # afternoon starts at 13; an 11 cap would make the window empty
+        try:
+            standby_queue.add_watch(["saturday"], "afternoon", 4, max_hour=11)
+            assert False, "Expected ValueError"
+        except ValueError as e:
+            assert "max_hour" in str(e)
+
+    def test_max_hour_above_23_raises(self):
+        try:
+            standby_queue.add_watch(["saturday"], "morning", 4, max_hour=24)
+            assert False, "Expected ValueError"
+        except ValueError as e:
+            assert "max_hour" in str(e)
+
 
 class TestCancelWatch:
     def setup_method(self):

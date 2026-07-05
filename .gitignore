@@ -16,3 +16,10 @@ state_*.json
 history.json
 shared_state.json
 accounts.json
+standby.log
+today_watch.log
+tournament.log
+cancel_dryrun_map.log
+standby_queue.json
+cancel_queue.json
+debug_screenshots/

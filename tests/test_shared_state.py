@@ -98,6 +98,42 @@ class TestSharedState:
         assert full is True  # 2/2
         assert who == ["michael", "grant"]
 
+    def test_claim_records_course(self):
+        _, state = shared_state.claim_booking(
+            "w", "saturday", "8:00 AM at Jimmy Clay", "michael",
+            course="Jimmy Clay",
+        )
+        assert state["saturday"]["bookings"][0]["course"] == "Jimmy Clay"
+
+    def test_claim_without_course_defaults_to_none(self):
+        _, state = shared_state.claim_booking(
+            "w", "saturday", "8:00 AM at Jimmy Clay", "michael"
+        )
+        assert state["saturday"]["bookings"][0]["course"] is None
+
+    def test_courses_booked_empty_when_nothing_booked(self):
+        assert shared_state.courses_booked("w", "saturday") == set()
+
+    def test_courses_booked_reflects_claimed_courses(self):
+        shared_state.claim_booking(
+            "w", "saturday", "8:00 AM at Jimmy Clay", "michael", course="Jimmy Clay"
+        )
+        shared_state.claim_booking(
+            "w", "saturday", "8:08 AM at Roy Kizer", "grant", course="Roy Kizer"
+        )
+        assert shared_state.courses_booked("w", "saturday") == {"Jimmy Clay", "Roy Kizer"}
+        # day isolation: sunday is unaffected
+        assert shared_state.courses_booked("w", "sunday") == set()
+
+    def test_courses_booked_ignores_none_course(self):
+        shared_state.claim_booking(
+            "w", "saturday", "8:00 AM at Jimmy Clay", "michael", course="Jimmy Clay"
+        )
+        shared_state.claim_booking(
+            "w", "saturday", "8:08 AM somewhere", "grant"  # legacy: no course
+        )
+        assert shared_state.courses_booked("w", "saturday") == {"Jimmy Clay"}
+
     def test_invalid_day_raises(self):
         try:
             shared_state.claim_booking("w", "monday", "x", "michael")

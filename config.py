@@ -6,13 +6,13 @@ SEARCH_URL = f"{BASE_URL}/search.html?display=detail&module=GR"
 LOGIN_URL = f"{BASE_URL}/login.html"
 
 # Course codes from Vermont Systems (secondarycode values in the dropdown).
-# Ordered by search priority: Lions > Roy Kizer > Jimmy Clay > Morris Williams.
+# Ordered by search priority: Jimmy Clay > Roy Kizer > Morris Williams > Lions.
 # Dict iteration order matters — the bot searches courses in this order.
 COURSE_CODES = {
-    "4": "Lions",
-    "2": "Roy Kizer",
     "1": "Jimmy Clay",
+    "2": "Roy Kizer",
     "3": "Morris Williams",
+    "4": "Lions",
 }
 
 # Time preferences in order of priority

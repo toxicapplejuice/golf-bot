@@ -3,7 +3,7 @@
 
 Checks the standby watch queue every invocation, searching for available
 tee times matching each active watch's preferences. Designed to run via
-crontab every 30 minutes (Tue-Sat).
+crontab every 15 minutes (Sun + Tue-Sat).
 
 Usage:
     # Add a watch
@@ -20,8 +20,8 @@ Usage:
     # Cancel a watch
     python3 standby_bot.py cancel abc123
 
-Crontab (every 30 min, Tue-Sat):
-    */30 * * * 2-6 /usr/bin/python3 -u /path/to/standby_bot.py check >> /path/to/standby.log 2>&1
+Crontab (every 15 min, Sun + Tue-Sat):
+    */15 * * * 0,2-6 /usr/bin/python3 -u /path/to/standby_bot.py check >> /path/to/standby.log 2>&1
 """
 
 from __future__ import annotations
@@ -181,6 +181,34 @@ def _search_course(
     return "continue"
 
 
+def _search_window(watch: dict) -> tuple[int, int]:
+    """(min_hour, max_hour) for a watch: the time_pref window, optionally
+    capped by the watch's max_hour (inclusive 24h hour)."""
+    min_hour, max_hour = standby_queue.TIME_PREF_RANGES[watch["time_pref"]]
+    cap = watch.get("max_hour")
+    if cap is not None:
+        max_hour = min(max_hour, cap)
+    return min_hour, max_hour
+
+
+def _player_counts(watch: dict) -> list[int]:
+    """Player counts to try for a watch, in descending priority order.
+
+    A watch with a min_players floor tries every count from players down
+    to that floor and never below it (so "at least 3 people" can't fall
+    back to a 2-person booking). Without a floor, legacy behavior: the
+    requested count, then FALLBACK_NUM_PLAYERS if smaller.
+    """
+    players = watch["players"]
+    floor = watch.get("min_players")
+    if floor is not None:
+        return list(range(players, floor - 1, -1))
+    counts = [players]
+    if FALLBACK_NUM_PLAYERS and FALLBACK_NUM_PLAYERS < players:
+        counts.append(FALLBACK_NUM_PLAYERS)
+    return counts
+
+
 def _search_day(page, day: str, watch: dict, dry_run: bool) -> bool:
     """Search all courses for openings on one day. Returns True if booked."""
     target_date = watch["target_dates"][day]
@@ -194,15 +222,11 @@ def _search_day(page, day: str, watch: dict, dry_run: bool) -> bool:
     except ValueError:
         return False
 
-    min_hour, max_hour = standby_queue.TIME_PREF_RANGES[watch["time_pref"]]
+    min_hour, max_hour = _search_window(watch)
     print(f"  [{day}] Searching {watch['time_pref']} slots on {target_date} "
-          f"({watch['players']}p)...")
+          f"({watch['players']}p, {min_hour}:00-{max_hour}:59)...")
 
-    player_counts = [watch["players"]]
-    if FALLBACK_NUM_PLAYERS and FALLBACK_NUM_PLAYERS < watch["players"]:
-        player_counts.append(FALLBACK_NUM_PLAYERS)
-
-    for num_players in player_counts:
+    for num_players in _player_counts(watch):
         label = f" ({num_players}p)" if num_players != watch["players"] else ""
         if label:
             print(f"  [{day}] Retrying with {num_players} players...")
@@ -291,11 +315,15 @@ def cmd_add(args) -> None:
         days=args.day,
         time_pref=args.time,
         players=args.players,
+        min_players=args.min_players,
+        max_hour=args.max_hour,
     )
+    min_hour, max_hour = _search_window(watch)
     print(f"Watch added: {watch['id']}")
     print(f"  Days: {', '.join(watch['days'])}")
-    print(f"  Time: {watch['time_pref']}")
-    print(f"  Players: {watch['players']}")
+    print(f"  Time: {watch['time_pref']} ({min_hour}:00-{max_hour}:59)")
+    floor = f" (min {watch['min_players']})" if watch.get("min_players") else ""
+    print(f"  Players: {watch['players']}{floor}")
     print(f"  Dates: {', '.join(f'{d}={v}' for d, v in watch['target_dates'].items())}")
     print(f"  Expires: {watch['expires_at']}")
 
@@ -345,6 +373,13 @@ def main():
     p_add.add_argument("--time", default="morning",
                        choices=["morning", "afternoon", "all"])
     p_add.add_argument("--players", type=int, default=4)
+    p_add.add_argument("--min-players", dest="min_players", type=int,
+                       default=None,
+                       help="Floor for the player-count fallback: try every "
+                            "count from --players down to this, never below")
+    p_add.add_argument("--max-hour", dest="max_hour", type=int, default=None,
+                       help="Cap the end of the time window (24h inclusive "
+                            "hour): morning + --max-hour 11 = 8am-11:59am")
 
     sub.add_parser("list", help="List all watches")
 

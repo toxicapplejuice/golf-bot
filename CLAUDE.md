@@ -78,7 +78,7 @@ python3 bot.py --now --dry-run --headful
 ## Standby Watch (cancellation polling)
 
 If you miss the Monday 8PM rush, queue a "standby watch" that polls for
-cancellations every 30 minutes. Uses one account to search + book.
+cancellations every 15 minutes. Uses one account to search + book.
 
 ### CLI
 
@@ -86,6 +86,12 @@ cancellations every 30 minutes. Uses one account to search + book.
 # Add a watch for this weekend
 python3 standby_bot.py add --day saturday --day sunday --time morning
 python3 standby_bot.py add --day saturday --time afternoon --players 2
+
+# "At least 3 people": try 4, fall back to 3, never book fewer
+python3 standby_bot.py add --day saturday --time morning --players 4 --min-players 3
+
+# Strict "by noon" watch — bare morning runs through the 1 o'clock hour
+python3 standby_bot.py add --day saturday --time morning --max-hour 11
 
 # List active watches
 python3 standby_bot.py list
@@ -98,11 +104,30 @@ python3 standby_bot.py check
 python3 standby_bot.py check --dry-run --headful
 ```
 
-### Crontab (every 30 min, Tue–Sat)
+### Crontab (every 15 min, Sun + Tue–Sat)
 
 ```
-*/30 * * * 2-6 /usr/bin/python3 -u /Users/michaelhsu/golf-bot/standby_bot.py check >> /Users/michaelhsu/golf-bot/standby.log 2>&1
+*/15 * * * 0,2-6 /usr/bin/python3 -u /Users/michaelhsu/golf-bot/standby_bot.py check >> /Users/michaelhsu/golf-bot/standby.log 2>&1
 ```
+
+Sunday (day 0) is included so same-day cancellations for a Sunday round
+are still caught; Monday is excluded because the main 8 PM bot owns it.
+
+**Cron does not fire while the Mac idle-sleeps** — this machine's
+`pmset` system sleep is 1 minute, and on 2026-07-04 that silently ate
+several 15-minute check cycles (visible as gaps between "Standby Check"
+headers in `standby.log`). While a watch is active, keep the Mac awake
+for the life of the watch:
+
+```bash
+# e.g. until Sunday midnight
+SECS=$(( $(date -j -f "%Y-%m-%d %H:%M:%S" "2026-07-05 23:59:59" +%s) - $(date +%s) ))
+nohup caffeinate -i -t $SECS >/dev/null 2>&1 &
+```
+
+The 8:51 AM Roy Kizer save on 7/05 came from a cancellation caught at
+7:31 PM the night before — evening-before and early-same-morning are
+the highest-yield windows, so missed cycles there hurt the most.
 
 ### Dashboard
 
@@ -115,11 +140,160 @@ watches directly from the UI.
 - `standby_queue.py` manages the watch queue (`standby_queue.json`)
 - `standby_bot.py check` reads active watches, logs in, searches all
   courses for each requested day/time, books if found
-- Time prefs: `morning` (8am–1pm), `afternoon` (1pm–5pm), `all` (8am–5pm)
+- Time prefs: `morning` (8am–1pm), `afternoon` (1pm–5pm), `all` (8am–5pm).
+  Hours are inclusive, so `morning` accepts up to a 1:59 PM tee time —
+  add `--max-hour N` to cap the window (e.g. `--max-hour 11` = by noon)
 - Player fallback: if no slots for requested count, retries with
-  FALLBACK_NUM_PLAYERS (2)
+  FALLBACK_NUM_PLAYERS (2). A watch created with `--min-players N` instead
+  tries every count from `--players` down to N and never books below the
+  floor (e.g. `--players 4 --min-players 3` tries 4 then 3, never 2)
 - Watches auto-expire Sunday 11:59 PM (end of the target weekend)
 - Old terminal watches are cleaned up after 14 days
+
+## Same-day watch (today_watch.py)
+
+One-off watcher for "find me a tee time TODAY in a precise window" runs —
+e.g. tonight 5:30–6:30 PM for 2 players. Unlike standby watches
+(weekend-only, hour-granular, cron-driven), this is a single self-looping
+process with a minute-precise inclusive window that exits at the end of
+the window.
+
+```bash
+# Auto-book watch: today, 5:30-6:30 PM, 2 players, check every 15 min.
+# caffeinate -i keeps the Mac from idle-sleeping while it runs.
+nohup caffeinate -i /usr/bin/python3 -u today_watch.py \
+    --start "5:30 PM" --end "6:30 PM" --players 2 >> today_watch.log 2>&1 &
+
+# Immediate one-shot check that only notifies (safe smoke test)
+python3 today_watch.py --once --mode notify
+```
+
+- Searches all `COURSE_CODES` courses, 18-hole then 9-hole listings
+  (`--holes "18,9"`) — evening twilight slots are often 9-hole-only
+- `--mode book` (default) books the earliest in-window slot, verifies it
+  via reservation history, notifies, and stops; `--mode notify` pushes
+  ntfy/email and keeps watching (re-alerts only on newly appeared times)
+- `--prefer "6:00 PM"` switches book mode from greedy (first course with
+  an in-window slot wins) to two-phase: scan ALL courses, then attempt
+  slots closest to the target first (ties go to the earlier time).
+  `--success-note "..."` appends a reminder to the terminal notifications
+  (booked / dry-run / needs-manual-check) — e.g. "cancel the held slot"
+- `--account-id <id>` books under a specific accounts.json account
+  (WebTrac holds one tee time per account per day, so an upgrade watch
+  should book under a different account than the slot you're holding)
+- Treats `unverified_post_click` as terminal NEEDS MANUAL CHECK — never
+  tries another slot after an ambiguous checkout
+- Fresh browser per cycle; per-cycle phantom blacklist so a "taken" slot
+  isn't retried within the same cycle (but is re-checked next cycle)
+- Ends when past `--end` (or when `--date` is in the past), with a final
+  "watch ended" push so you know it's over
+- Grep-able log markers: `BOOKED` / `FOUND` / `DRY-RUN OK` /
+  `NEEDS MANUAL CHECK` / `LOGIN FAILED` / `CYCLE ERROR` / `WATCH ENDED` /
+  `FATAL`
+
+## Cancellation
+
+Cancel a booked tee time from the dashboard (or CLI). **A confirmation
+number is required** — WebTrac's `teetimecancel.html` is a search-by-
+confirmation-number form, not a clickable list of reservations, and the
+number is NOT shown in the reservation history. Get it from the WebTrac
+booking email, or from **My Account → Reprint A Receipt**: the receipt PDF
+lists the per-player confirmation numbers (comma-separated, e.g.
+`324180014,324180016,...` for a 4-player slot — the form accepts the full
+comma-separated list; proven live 2026-07-04). Note the receipt number
+itself is NOT a confirmation number; searching with it finds nothing.
+`fetch_receipt.py` automates the recovery: it logs in, downloads the
+receipt PDF from the reprint page, and prints the confirmation numbers
+(no PDF library needed — it zlib-inflates the content streams directly):
+
+```bash
+python3 fetch_receipt.py list --account michael          # recent receipts
+python3 fetch_receipt.py get --account michael --receipt 7419958
+```
+
+The cancel-search result messages distinguish failure modes:
+- "No tee times available for Confirmation Number and Time selected." —
+  no match: wrong number, or wrong hour/minute/AM-PM
+- "... and Time selected **that can be cancelled**." — the reservation
+  matched but can't be cancelled (e.g. the tee time is already in the
+  past). Past tee times simply age out; a $0 receipt means nothing owed.
+The bot logs into the holding account, opens the
+bare `teetimecancel.html` page (which mints a session-specific `_csrf_token`),
+fills in the confirmation number + tee-time selects, submits the search,
+confirms the cancel, and verifies the slot is no longer active in the
+reservation history.
+
+### CLI
+
+```bash
+# Run a queued cancel job (normally spawned by the dashboard Cancel button)
+python3 cancel_bot.py run --job <id>
+python3 cancel_bot.py run --job <id> --dry-run --headful
+
+# One-off manual cancel (not persisted) — --confirmation is required
+python3 cancel_bot.py cancel --account michael --date 6/13/2026 \
+    --time "8:01 AM" --course "Roy Kizer" --confirmation R1234567
+python3 cancel_bot.py cancel --account michael --date 6/13/2026 \
+    --time "8:01 AM" --course "Roy Kizer" --confirmation R1234567 \
+    --dry-run --headful
+```
+
+### Dashboard
+
+Each future booking in the History section shows a **Cancel** button (one
+per sub-booking for multi-account weekends). Clicking it pops a `prompt()`
+dialog that names the exact slot, warns the cancel is permanent, and asks
+for the confirmation number from the WebTrac email. Dismissing it or leaving
+it blank aborts. Otherwise it POSTs to `/api/booking/cancel`, which spawns
+the runner and polls `/api/cancel/jobs` until the job reaches `done`/`failed`.
+Cancelled bookings render as "Cancelled".
+
+### How it works
+
+- `cancel_queue.py` manages the cancel queue (`cancel_queue.json`) with the
+  same `fcntl.flock` atomic read-modify-write as `standby_queue.py`. The
+  confirmation number is a required, frozen field on each job.
+- `cancel_bot.py run --job <id>` loads the job, logs in as the holding
+  account, drives the `teetimecancel.html` form (confirmation number + the
+  three hour/minute/AM-PM selects), submits the search, confirms the cancel,
+  verifies the slot is no longer active, marks it `cancelled` in
+  `history.json`, and notifies.
+- A dup-spawn guard (`find_active_for`) means a double-click can't fire two
+  cancels for the same slot — the second POST returns the existing job.
+- Result codes: `cancelled` (verified no longer active), `dry_run`, or
+  `failed: <reason>` (no matching reservation, confirm step not actionable,
+  history unreachable, etc.).
+- **Verify-gone is status-aware.** A cancelled reservation is NOT removed
+  from the WebTrac history table — its Status cell merely flips from
+  "Reserved" to "Cancelled". So `bot._active_slot_in_content` requires a
+  slot-matching row whose Status still reads "Reserved"; a flat text match
+  would forever report "still present".
+
+### Safety (cancellation is irreversible)
+
+- `--dry-run` navigates to the cancel page, fills + submits the search, dumps
+  the result page, and **stops before confirming the cancel**
+- Strict hour/minute/AM-PM parse of the stored time into the form's selects;
+  an unparseable time or a missing confirmation number aborts before the form
+  is touched
+- Post-cancel verify-gone: success is only reported if the slot is no longer
+  active in history afterward (an unreachable history page is `failed`, never
+  a false success)
+- The dashboard always gates a real cancel behind the `prompt()` dialog, and
+  the runner always dumps the cancel-page HTML to `debug_screenshots/`
+
+The full flow was mapped live on 2026-07-03 (real cancel of a 7/04 Morris
+Williams booking): after Search matches, a Continue anchor
+(`#webteetimecancel_buttonaddtocart`) routes through
+`addtocart.html?action=cancellation` — the same cart checkout as booking —
+then `#webcart_buttoncheckout` (Proceed To Checkout) and
+`#webcheckout_buttoncontinue` must be clicked before `confirmation.html`
+is reached. `_confirm_cancel` walks these steps and returns success ONLY
+if a confirmation/receipt URL is reached: cancellation items stranded in
+the cart also hide the "Reserved" history row, so verify-gone alone reads
+a pending-in-cart cancel as done (this false success happened live before
+the checkout walk was added). The live not-found message is "No tee times
+available for Confirmation Number and Time selected."
 
 ## Tests
 
@@ -133,10 +307,54 @@ get_next_weekend_dates, phantom blacklist tuple shape, course config
 integrity, and player-count fallback config). 30 tests.
 
 `tests/test_standby.py` covers standby queue operations (add, cancel,
-expire, mark booked, active filtering, cleanup). 67 tests.
+expire, mark booked, active filtering, cleanup, `min_players` and
+`max_hour` validation). 40 tests.
+
+`tests/test_standby_bot.py` covers `_player_counts` (the min_players floor
+walks 4→3 and never below; legacy watches without the key still fall back
+to FALLBACK_NUM_PLAYERS) and `_search_window` (max_hour caps the pref
+window; wider caps are ignored; legacy watches unaffected).
+
+`tests/test_cancel_queue.py` covers the cancel queue (add/get/list/update,
+validation including the required `confirmation_number`, `find_active_for`
+dup guard, `clear_old_jobs`).
+
+`tests/test_today_watch.py` covers the same-day watcher's pure helpers:
+`parse_window` (boundaries, noon/midnight, unparseable/inverted),
+`slots_in_window` (inclusive bounds, AM/PM, unparseable times),
+`date_relation` (padding-agnostic past/today/future, malformed raises),
+`parse_holes`, and the `build_search_url` holes parameter.
+
+`tests/test_cancel.py` covers the bot.py cancel refactor: `_slot_in_content`
+(date padding + condensed "8:01A" time + course), the status-aware
+`_active_slot_in_content` (cancelled rows persist in history → must read as
+not-active), `_fetch_history_content` (timeout/login/queue → None), and
+`mark_booking_cancelled` (multi + single + legacy-no-course shapes,
+idempotent, wrong-account/time/date no-ops).
+
+`tests/test_cancel_bot.py` covers the form-driving helpers: `_parse_time_to_slots`
+(zero-padding + AM/PM + range/format validation), `_slot_for`, `_set_combobox`
+(native select_option, the JS fallback for the Vue-hidden selects, and
+read-back verification), the `_fill_cancel_form` orchestration (fills
+confirmation number + the three selects + Search; bails on missing
+confirmation number, unparseable time, or any select that won't hold its
+value — submitting with a wrong AM/PM searches the wrong reservation),
+and the `_search_found_reservation` not-found heuristic including the
+live "No tee times available" message.
+
+`tests/test_fetch_receipt.py` covers `extract_confirmation_numbers` (the
+zlib-stream PDF parse: compressed/uncompressed/CRLF streams, the
+Confirmation-label guard for lone numbers, digit-boundary anchoring so
+phone numbers and household ids never match, multi-tee-time receipts,
+dedupe).
+
+`tests/test_monitor_cancel.py` spins up the real monitor `Handler` on an
+ephemeral port (browser spawn + account lookup stubbed) to exercise the
+`/api/booking/cancel` and `/api/cancel/jobs` routes, the dup-spawn guard, and
+the required-confirmation-number validation.
 
 There are no browser-integration tests — the only way to verify the
-Playwright path is `--dry-run` against the live site.
+Playwright booking/cancel path is `--dry-run` against the live site.
 
 ## Configuration
 
