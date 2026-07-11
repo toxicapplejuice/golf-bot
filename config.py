@@ -44,7 +44,7 @@ NUM_PLAYERS = 4
 
 # If no slots found for NUM_PLAYERS, retry with this many.
 # Set to None to disable the fallback.
-FALLBACK_NUM_PLAYERS = 2
+FALLBACK_NUM_PLAYERS = None
 
 # How many tee times to book per day across all accounts (in multi-account mode).
 # Each account books at most ONE slot per day; this caps the total per-day booking

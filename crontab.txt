@@ -1,0 +1,3 @@
+# OLD: 58 19 * * 1 > /Users/michaelhsu/golf-bot/booking.log && /usr/bin/python3 -u /Users/michaelhsu/golf-bot/bot.py >> /Users/michaelhsu/golf-bot/booking.log 2>&1
+51 19 * * 1 > /Users/michaelhsu/golf-bot/multi_bot.log && /usr/bin/python3 -u /Users/michaelhsu/golf-bot/multi_bot.py >> /Users/michaelhsu/golf-bot/multi_bot.log 2>&1
+*/15 * * * 0,2-6 /usr/bin/python3 -u /Users/michaelhsu/golf-bot/standby_bot.py check >> /Users/michaelhsu/golf-bot/standby.log 2>&1

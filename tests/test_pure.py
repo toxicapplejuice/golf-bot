@@ -136,7 +136,10 @@ class TestCourseConfig:
 
 class TestPlayerFallback:
     def test_fallback_is_less_than_default(self):
-        assert config.FALLBACK_NUM_PLAYERS < config.NUM_PLAYERS
+        # None disables the fallback; a numeric value must be below the default
+        # or bot.py's `FALLBACK_NUM_PLAYERS < num_players` guard never fires.
+        assert (config.FALLBACK_NUM_PLAYERS is None
+                or config.FALLBACK_NUM_PLAYERS < config.NUM_PLAYERS)
 
     def test_fallback_is_at_least_1(self):
         assert config.FALLBACK_NUM_PLAYERS is None or config.FALLBACK_NUM_PLAYERS >= 1
@@ -144,8 +147,10 @@ class TestPlayerFallback:
     def test_default_is_4(self):
         assert config.NUM_PLAYERS == 4
 
-    def test_fallback_is_2(self):
-        assert config.FALLBACK_NUM_PLAYERS == 2
+    def test_fallback_is_disabled(self):
+        # 4 players or nothing — no fallback pass (user requirement 2026-07-06:
+        # never book below a full foursome from the Monday-night bot).
+        assert config.FALLBACK_NUM_PLAYERS is None
 
 
 class TestNavRecoveryConstant:
