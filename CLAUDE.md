@@ -8,15 +8,32 @@ Vermont Systems / WebTrac booking site releases them on Monday at 8:00 PM CT.
 
 ## How it actually runs
 
-**Local macOS crontab entry on this machine.** Nothing else.
+**Local macOS launchd LaunchAgents on this machine.** Nothing else.
+Migrated from cron on 2026-07-13 after a session's out-of-order sandboxed
+`crontab` installs emptied the crontab on 2026-07-06 and it went unnoticed
+for a week (cron also silently skips fires while the Mac sleeps; launchd
+fires a missed calendar event on wake).
 
-```
-58 19 * * 1 > /Users/michaelhsu/golf-bot/booking.log && /usr/bin/python3 -u /Users/michaelhsu/golf-bot/bot.py >> /Users/michaelhsu/golf-bot/booking.log 2>&1
+Two agents in `~/Library/LaunchAgents` (copies in `launchd/` in this repo):
+
+- `com.michaelhsu.golfbot.monday.plist` — `multi_bot.py`, Mondays 7:51 PM CT
+- `com.michaelhsu.golfbot.standby.plist` — `standby_bot.py check`, every
+  15 min on Sunday + Tue–Sat (never Monday)
+
+```bash
+launchctl list | grep golfbot                                  # both loaded?
+launchctl print gui/$(id -u)/com.michaelhsu.golfbot.monday     # schedule/state
+launchctl kickstart gui/$(id -u)/com.michaelhsu.golfbot.standby  # manual test-fire
 ```
 
-The bot launches at 7:58 PM CT (2 minutes before release), hits the
-Queue-it waiting room intentionally, waits through it, lands authenticated
-right at 8:00 PM, and starts searching.
+The user crontab is intentionally comment-only (`crontab.txt` documents the
+migration). **Do NOT re-add cron entries for the bot** — they would
+double-fire alongside the LaunchAgents. To change the schedule, edit the
+plist, then `launchctl bootout gui/$(id -u)/<label>` and re-`bootstrap` it.
+
+The Monday agent launches the bot at 7:51 PM CT (9 minutes before release);
+it hits the Queue-it waiting room intentionally, waits through it, lands
+authenticated right at 8:00 PM, and starts searching.
 
 **This bot is NOT deployed to:**
 - Fly.io (old `fly.toml` was deleted in commit `42fc615`)
@@ -98,11 +115,11 @@ python3 standby_bot.py check
 python3 standby_bot.py check --dry-run --headful
 ```
 
-### Crontab (every 30 min, Tue–Sat)
+### Schedule (launchd, every 15 min on Sun + Tue–Sat)
 
-```
-*/30 * * * 2-6 /usr/bin/python3 -u /Users/michaelhsu/golf-bot/standby_bot.py check >> /Users/michaelhsu/golf-bot/standby.log 2>&1
-```
+Runs via `com.michaelhsu.golfbot.standby.plist` (see "How it actually
+runs" above) — every 15 minutes on Sunday and Tue–Sat, never Monday.
+Output appends to `standby.log` via the agent's `StandardOutPath`.
 
 ### Dashboard
 

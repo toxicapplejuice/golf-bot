@@ -1,0 +1,22 @@
+# ============================================================================
+# MIGRATED TO launchd ON 2026-07-13 — this crontab is intentionally empty.
+#
+# The golf-bot schedule now lives in ~/Library/LaunchAgents:
+#   com.michaelhsu.golfbot.monday.plist   — multi_bot.py, Mondays 7:51 PM CT
+#   com.michaelhsu.golfbot.standby.plist  — standby_bot.py check, every 15 min
+#                                           on Sun + Tue-Sat (days 0,2-6)
+#
+# Manage with:
+#   launchctl list | grep golfbot
+#   launchctl print gui/$(id -u)/com.michaelhsu.golfbot.monday
+#
+# Why migrated: on 2026-07-06 a Claude Code session's out-of-order sandboxed
+# `crontab` installs emptied the crontab and it went unnoticed for a week.
+# launchd agents are file-based and fire missed runs on wake (cron skips
+# fires while the Mac sleeps). DO NOT re-add cron entries for the bot —
+# that would double-fire alongside the LaunchAgents.
+#
+# Old entries, for reference:
+# 51 19 * * 1 > /Users/michaelhsu/golf-bot/multi_bot.log && /usr/bin/python3 -u /Users/michaelhsu/golf-bot/multi_bot.py >> /Users/michaelhsu/golf-bot/multi_bot.log 2>&1
+# */15 * * * 0,2-6 /usr/bin/python3 -u /Users/michaelhsu/golf-bot/standby_bot.py check >> /Users/michaelhsu/golf-bot/standby.log 2>&1
+# ============================================================================
