@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.michaelhsu.golfbot.monday</string>
+
+    <!-- Mondays 7:51 PM local (CT): truncate multi_bot.log, then launch the
+         multi-account orchestrator. Mirrors the old cron line exactly:
+         51 19 * * 1 > multi_bot.log && python3 -u multi_bot.py >> multi_bot.log 2>&1
+         launchd fires a missed event on wake if the Mac was asleep at 19:51. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>&gt; /Users/michaelhsu/golf-bot/multi_bot.log &amp;&amp; exec /usr/bin/python3 -u /Users/michaelhsu/golf-bot/multi_bot.py &gt;&gt; /Users/michaelhsu/golf-bot/multi_bot.log 2&gt;&amp;1</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/michaelhsu/golf-bot</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>19</integer>
+        <key>Minute</key>
+        <integer>51</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
