@@ -327,10 +327,11 @@ HTML = """<!DOCTYPE html>
       <button class="standby-add-btn" onclick="toggleAddForm()">+ Add Watch</button>
     </div>
     <div class="standby-form" id="standbyForm" style="display:none">
+      <label><input type="checkbox" id="cbFri"> Fri</label>
       <label><input type="checkbox" id="cbSat" checked> Sat</label>
       <label><input type="checkbox" id="cbSun" checked> Sun</label>
       <select id="timePref">
-        <option value="morning">Morning (8am–1pm)</option>
+        <option value="morning">Morning (7am–11am)</option>
         <option value="afternoon">Afternoon (1pm–5pm)</option>
         <option value="all">All Day (8am–5pm)</option>
       </select>
@@ -850,6 +851,7 @@ function toggleAddForm() {
 
 async function submitWatch() {
   const days = [];
+  if (document.getElementById('cbFri').checked) days.push('friday');
   if (document.getElementById('cbSat').checked) days.push('saturday');
   if (document.getElementById('cbSun').checked) days.push('sunday');
   if (!days.length) { alert('Select at least one day'); return; }

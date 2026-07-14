@@ -16,16 +16,21 @@ import standby_queue  # noqa: E402
 
 class TestTimePrefRanges:
     def test_morning_range(self):
-        assert standby_queue.TIME_PREF_RANGES["morning"] == (8, 13)
+        assert standby_queue.TIME_PREF_RANGES["morning"] == (420, 660)
 
     def test_afternoon_range(self):
-        assert standby_queue.TIME_PREF_RANGES["afternoon"] == (13, 17)
+        assert standby_queue.TIME_PREF_RANGES["afternoon"] == (780, 1020)
 
     def test_all_range(self):
-        assert standby_queue.TIME_PREF_RANGES["all"] == (8, 17)
+        assert standby_queue.TIME_PREF_RANGES["all"] == (480, 1020)
 
     def test_valid_time_prefs_match_keys(self):
         assert set(standby_queue.VALID_TIME_PREFS) == set(standby_queue.TIME_PREF_RANGES.keys())
+
+    def test_morning_excludes_after_11(self):
+        min_m, max_m = standby_queue.TIME_PREF_RANGES["morning"]
+        assert min_m == 7 * 60
+        assert max_m == 11 * 60
 
 
 class TestComputeExpiry:
@@ -43,33 +48,58 @@ class TestComputeExpiry:
 
 
 class TestGetUpcomingWeekendDates:
-    def test_weekday_returns_this_saturday(self):
-        # Wednesday May 14 2026 -> Saturday May 16 2026
+    def test_weekday_returns_this_weekend(self):
+        # Wednesday May 14 2026 -> Fri May 15, Sat May 16, Sun May 17
         with patch("standby_queue.datetime") as mock_dt:
             mock_dt.now.return_value = datetime(2026, 5, 14, 10, 0, 0)
             mock_dt.strptime = datetime.strptime
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            sat, sun = standby_queue.get_upcoming_weekend_dates()
+            fri, sat, sun = standby_queue.get_upcoming_weekend_dates()
+        assert "15" in fri
         assert "16" in sat
         assert "17" in sun
 
-    def test_saturday_returns_today(self):
+    def test_friday_returns_today(self):
+        # Friday May 15 2026
+        with patch("standby_queue.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 5, 15, 10, 0, 0)
+            mock_dt.strptime = datetime.strptime
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            fri, sat, sun = standby_queue.get_upcoming_weekend_dates()
+        assert "15" in fri
+        assert "16" in sat
+        assert "17" in sun
+
+    def test_saturday_returns_yesterday_friday(self):
         with patch("standby_queue.datetime") as mock_dt:
             mock_dt.now.return_value = datetime(2026, 5, 16, 10, 0, 0)
             mock_dt.strptime = datetime.strptime
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            sat, sun = standby_queue.get_upcoming_weekend_dates()
+            fri, sat, sun = standby_queue.get_upcoming_weekend_dates()
+        assert "15" in fri
         assert "16" in sat
         assert "17" in sun
 
-    def test_sunday_returns_yesterday_saturday(self):
+    def test_sunday_returns_this_weekend(self):
         with patch("standby_queue.datetime") as mock_dt:
             mock_dt.now.return_value = datetime(2026, 5, 17, 10, 0, 0)
             mock_dt.strptime = datetime.strptime
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            sat, sun = standby_queue.get_upcoming_weekend_dates()
+            fri, sat, sun = standby_queue.get_upcoming_weekend_dates()
+        assert "15" in fri
         assert "16" in sat
         assert "17" in sun
+
+    def test_monday_returns_next_weekend(self):
+        # Monday May 18 2026 -> Fri May 22, Sat May 23, Sun May 24
+        with patch("standby_queue.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 5, 18, 10, 0, 0)
+            mock_dt.strptime = datetime.strptime
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            fri, sat, sun = standby_queue.get_upcoming_weekend_dates()
+        assert "22" in fri
+        assert "23" in sat
+        assert "24" in sun
 
 
 class TestAddWatch:
@@ -103,6 +133,24 @@ class TestAddWatch:
         assert watch["players"] == 2
         assert "sunday" not in watch["target_dates"]
 
+    def test_add_friday_watch(self):
+        watch = standby_queue.add_watch(["friday"], "morning", 4)
+        assert watch["days"] == ["friday"]
+        assert "friday" in watch["target_dates"]
+        assert watch["results"]["friday"] is None
+
+    def test_add_friday_saturday_watch(self):
+        watch = standby_queue.add_watch(["friday", "saturday"], "morning", 4)
+        assert watch["days"] == ["friday", "saturday"]
+        assert "friday" in watch["target_dates"]
+        assert "saturday" in watch["target_dates"]
+
+    def test_add_all_three_days(self):
+        watch = standby_queue.add_watch(["friday", "saturday", "sunday"], "all", 2)
+        assert watch["days"] == ["friday", "saturday", "sunday"]
+        assert len(watch["target_dates"]) == 3
+        assert all(d in watch["results"] for d in ["friday", "saturday", "sunday"])
+
     def test_add_persists_to_file(self):
         standby_queue.add_watch(["saturday"], "morning", 4)
         standby_queue.add_watch(["sunday"], "all", 2)
@@ -115,6 +163,13 @@ class TestAddWatch:
             assert False, "Expected ValueError"
         except ValueError as e:
             assert "monday" in str(e)
+
+    def test_thursday_invalid(self):
+        try:
+            standby_queue.add_watch(["thursday"], "morning", 4)
+            assert False, "Expected ValueError"
+        except ValueError as e:
+            assert "thursday" in str(e)
 
     def test_invalid_time_pref_raises(self):
         try:
@@ -245,6 +300,13 @@ class TestMarkDayBooked:
         standby_queue.mark_day_booked(watch["id"], "sunday", "9:00 AM at Roy Kizer")
         watches = standby_queue.list_watches()
         assert watches[0]["status"] == "booked"
+
+    def test_mark_friday_booked(self):
+        watch = standby_queue.add_watch(["friday"], "morning", 4)
+        standby_queue.mark_day_booked(watch["id"], "friday", "9:00 AM at Lions")
+        watches = standby_queue.list_watches()
+        assert watches[0]["status"] == "booked"
+        assert watches[0]["results"]["friday"]["booked"] is True
 
 
 class TestExpireStaleWatches:

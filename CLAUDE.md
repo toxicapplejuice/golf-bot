@@ -90,8 +90,8 @@ python3 standby_bot.py add --day saturday --time afternoon --players 2
 # "At least 3 people": try 4, fall back to 3, never book fewer
 python3 standby_bot.py add --day saturday --time morning --players 4 --min-players 3
 
-# Strict "by noon" watch — bare morning runs through the 1 o'clock hour
-python3 standby_bot.py add --day saturday --time morning --max-hour 11
+# Strict "by 10" watch — caps the morning window at 9:59 AM
+python3 standby_bot.py add --day saturday --time morning --max-hour 9
 
 # List active watches
 python3 standby_bot.py list
@@ -140,9 +140,9 @@ watches directly from the UI.
 - `standby_queue.py` manages the watch queue (`standby_queue.json`)
 - `standby_bot.py check` reads active watches, logs in, searches all
   courses for each requested day/time, books if found
-- Time prefs: `morning` (8am–1pm), `afternoon` (1pm–5pm), `all` (8am–5pm).
-  Hours are inclusive, so `morning` accepts up to a 1:59 PM tee time —
-  add `--max-hour N` to cap the window (e.g. `--max-hour 11` = by noon)
+- Time prefs are minute-precise: `morning` (7:00–11:00 AM), `afternoon`
+  (1:00–5:00 PM), `all` (8:00 AM–5:00 PM). Add `--max-hour N` to cap the
+  window at N:59 (e.g. `--max-hour 9` = nothing after 9:59 AM)
 - Player fallback: if no slots for requested count, retries with
   FALLBACK_NUM_PLAYERS (2). A watch created with `--min-players N` instead
   tries every count from `--players` down to N and never books below the
