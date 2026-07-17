@@ -20,6 +20,7 @@ standby.log
 today_watch.log
 tournament.log
 cancel_dryrun_map.log
+monitor.log
 standby_queue.json
 cancel_queue.json
 debug_screenshots/
