@@ -604,13 +604,23 @@ def is_in_queue(page) -> bool:
 
 
 def is_authenticated(page) -> bool:
-    """True if the page shows logged-in chrome (Sign Out / My Account link)."""
+    """True if the page shows logged-in chrome (Sign Out / My Account link).
+
+    The 2026-07 site redesign renders Logout as a <button> on a
+    "You are logged in" welcome page, so match buttons and that text
+    too, not just anchor links.
+    """
     if is_in_queue(page) or is_on_login_page(page):
         return False
     try:
-        if page.locator("a:has-text('Sign Out'), a:has-text('Logout'), a:has-text('Log Out')").count() > 0:
+        if page.locator(
+            "a:has-text('Sign Out'), a:has-text('Logout'), a:has-text('Log Out'), "
+            "button:has-text('Sign Out'), button:has-text('Logout'), button:has-text('Log Out')"
+        ).count() > 0:
             return True
-        if page.locator("a:has-text('My Account')").count() > 0:
+        if page.locator("a:has-text('My Account'), a:has-text('My Profile')").count() > 0:
+            return True
+        if "you are logged in" in page.content().lower():
             return True
     except Exception:
         pass
@@ -733,6 +743,15 @@ def login_once(page, queue_mode: str = "timeout") -> bool:
 
     if not handle_queue_if_present():
         return False
+
+    # A previous attempt on this same page may have logged in even though a
+    # later step timed out (e.g. a slow Cloudflare interstitial after submit).
+    # The logged-in home page has no Sign In link, so without this check every
+    # retry would time out on "click Sign In" until attempts are exhausted.
+    if is_authenticated(page):
+        print("  [login] Already authenticated — skipping sign-in")
+        update_live_screenshot(page, "logged in")
+        return True
 
     if not step("click Sign In",
                 lambda: page.click("a:has-text('Sign In')", timeout=60000)):
