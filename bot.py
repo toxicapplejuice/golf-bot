@@ -718,6 +718,8 @@ def wait_until_release_time() -> None:
 # ======================================================================
 
 def login_once(page, queue_mode: str = "timeout") -> bool:
+    global _last_login_noop
+
     def step(label: str, action) -> bool:
         try:
             action()
@@ -751,6 +753,7 @@ def login_once(page, queue_mode: str = "timeout") -> bool:
     if is_authenticated(page):
         print("  [login] Already authenticated — skipping sign-in")
         update_live_screenshot(page, "logged in")
+        _last_login_noop = True
         return True
 
     if not step("click Sign In",
@@ -809,6 +812,7 @@ def login_once(page, queue_mode: str = "timeout") -> bool:
 
     print("  [login] Success!")
     update_live_screenshot(page, "logged in")
+    _last_login_noop = False
     return True
 
 
@@ -847,6 +851,60 @@ _rush_mode = False
 def set_rush_mode(enabled: bool) -> None:
     global _rush_mode
     _rush_mode = enabled
+
+
+# ======================================================================
+# Cart-bounce circuit breaker (2026-07-20 postmortem)
+# ======================================================================
+# On the 2026-07-20 release the site repeatedly bounced the Add-to-cart click
+# to login.html even though the *browsing* session was still valid. Each bounce
+# was read as "session expired", so the bot re-logged in — but login was a no-op
+# ("already authenticated"), so nothing changed and the same slot bounced again.
+# The result was 192 futile attempts that burned the entire 30-minute budget
+# (and hammered the site) without ever booking. This breaker detects that loop
+# — consecutive no-op re-logins triggered by cart bounces — and aborts the run
+# so it fails fast instead of spinning. A genuine session expiry (which performs
+# a REAL login) or any cart action that actually reaches the site resets it, so
+# only the pathological loop trips it.
+
+MAX_CART_BOUNCE_REEXPIRY = 5
+
+# Set by login_once: True when login short-circuited on "already authenticated"
+# (a no-op), False when a real form login was performed.
+_last_login_noop = False
+_cart_bounce_reexpiry = 0
+_circuit_tripped = False
+
+
+def reset_session_circuit() -> None:
+    """Reset the cart-bounce circuit breaker. Called once at the start of a run."""
+    global _cart_bounce_reexpiry, _circuit_tripped
+    _cart_bounce_reexpiry = 0
+    _circuit_tripped = False
+
+
+def note_cart_bounce_reexpiry() -> bool:
+    """Record a no-op re-login caused by a cart bounce to login.
+
+    Returns True if the circuit is now tripped (too many consecutive no-op
+    re-expiries — the site is refusing checkout and retrying won't help).
+    """
+    global _cart_bounce_reexpiry, _circuit_tripped
+    _cart_bounce_reexpiry += 1
+    if _cart_bounce_reexpiry >= MAX_CART_BOUNCE_REEXPIRY:
+        _circuit_tripped = True
+    return _circuit_tripped
+
+
+def note_cart_progress() -> None:
+    """A cart action reached the site (booked / taken / failed — not a login
+    bounce), so the session is healthy. Reset the consecutive no-op counter."""
+    global _cart_bounce_reexpiry
+    _cart_bounce_reexpiry = 0
+
+
+def session_circuit_tripped() -> bool:
+    return _circuit_tripped
 
 
 def navigate_to_search(page, url: str) -> bool:
@@ -1417,13 +1475,31 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
             print("session expired")
             if not login_with_retry(page, queue_mode="timeout"):
                 return result
+            if _last_login_noop:
+                # Cart bounced us to login but the browsing session is still
+                # valid — the re-login did nothing. Count it; if this keeps
+                # recurring the site is refusing checkout and looping is futile.
+                if note_cart_bounce_reexpiry():
+                    save_debug_screenshot(page, "cart_bounce_circuit_break")
+                    print(f"  [book] CIRCUIT BREAKER: {MAX_CART_BOUNCE_REEXPIRY} "
+                          f"consecutive cart-bounce-to-login with a healthy "
+                          f"session — site is refusing checkout; aborting run")
+                    result["abort_run"] = True
+                    return result
+            else:
+                # A real re-authentication happened — genuine recovery, not the
+                # pathological no-op loop. Clear the streak.
+                note_cart_progress()
             if not navigate_to_search(page, url):
                 return result
             # DOM state is stale now — bail to outer loop
             break
 
         # taken / failed: blacklist and try next slot (requires re-nav to refresh DOM)
+        # The cart action reached the site (it didn't bounce to login), so the
+        # session is healthy — clear the cart-bounce streak.
         print("taken" if status == "taken" else "failed")
+        note_cart_progress()
         blacklist.add(key)
         if not navigate_to_search(page, url):
             break
@@ -1501,6 +1577,10 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
                     # Stop everything for this day to prevent duplicates.
                     print(f"  [halt] {day_name} halted after possible-but-unverified "
                           f"booking — see notification for manual check")
+                    return result
+                if result.get("abort_run"):
+                    # Cart-bounce circuit breaker tripped — the site is refusing
+                    # checkout. Stop; retrying more courses/days won't help.
                     return result
             page.wait_for_timeout(REFRESH_BETWEEN_ROUNDS_MS)
         print(f"  {pass_label} pass exhausted for {day_name}")
@@ -1582,6 +1662,7 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
         if (not results[day_key]["success"]
                 and not results[day_key].get("skipped")
                 and not results[day_key].get("halt_day")
+                and not results[day_key].get("abort_run")
                 and FALLBACK_NUM_PLAYERS is not None
                 and FALLBACK_NUM_PLAYERS < num_players):
             print(f"\n  === {day_name.upper()} / retrying with {FALLBACK_NUM_PLAYERS} players ===")
@@ -1603,6 +1684,11 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
             )
 
     book_day("saturday", saturday_date, "saturday")
+
+    if session_circuit_tripped():
+        print("\n*** Cart-bounce circuit breaker tripped — aborting session "
+              "(site refusing checkout); skipping Sunday ***")
+        return False
 
     if _rush_mode:
         set_rush_mode(False)
@@ -1644,6 +1730,7 @@ def run_booking(args) -> dict:
     start_time = time.time()
     run_started_iso = datetime.now().isoformat(timespec="seconds")
     session_count = 0
+    reset_session_circuit()
 
     # Watchdog — urgent notification if the bot appears stuck
     watchdog = Watchdog(log_path=BOOKING_LOG_PATH)
@@ -1709,6 +1796,19 @@ def run_booking(args) -> dict:
                     done = False
 
                 if done:
+                    break
+
+                if session_circuit_tripped():
+                    print("\n*** Cart-bounce circuit breaker tripped — the site is "
+                          "refusing checkout; stopping run instead of looping ***")
+                    send_ntfy(
+                        f"[{ACCOUNT_DISPLAY_NAME}] aborted — site refusing checkout",
+                        f"Add-to-cart kept bouncing to login with a healthy session "
+                        f"({MAX_CART_BOUNCE_REEXPIRY}+ times). Stopped early to avoid a "
+                        f"futile retry loop. Slots were visible but not bookable — "
+                        f"likely site overload/anti-bot at release. Check manually.",
+                        priority="high", tags="warning",
+                    )
                     break
 
                 remaining = args.max_time - (time.time() - start_time)
