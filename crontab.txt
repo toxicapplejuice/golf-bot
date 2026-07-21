@@ -1,3 +1,33 @@
-# OLD: 58 19 * * 1 > /Users/michaelhsu/golf-bot/booking.log && /usr/bin/python3 -u /Users/michaelhsu/golf-bot/bot.py >> /Users/michaelhsu/golf-bot/booking.log 2>&1
+# Golf Bot schedule — CRON (restored 2026-07-20 after the launchd experiment failed).
+#
+# History:
+#   - Originally cron. On 2026-07-06 a Claude Code session's out-of-order
+#     sandboxed `crontab` installs emptied the crontab (self-inflicted, not a
+#     cron defect).
+#   - On 2026-07-13 migrated to launchd LaunchAgents on the (false) premise that
+#     launchd "fires missed runs on wake."
+#   - On 2026-07-20 launchd was PROVEN to fire StartCalendarInterval ~2h LATE
+#     even while the machine is awake: the Monday agent fired 21:51 instead of
+#     19:51 on both 7/13 and 7/20, and the every-15-min standby agent went
+#     silent for ~20h. Reverted to cron, which fires ON TIME when the machine
+#     is awake (no launchd timer coalescing).
+#
+# AWAKE GUARANTEE (cron skips fires while the Mac sleeps; pmset sleep is 1 min):
+#   - Monday 7:51 PM release — schedule a weekly hardware wake at 7:45 PM:
+#         sudo pmset repeat wakeorpoweron M 19:45:00
+#     Verify with:  pmset -g sched
+#   - Standby watches — keep the Mac awake with `caffeinate -i` (or Amphetamine)
+#     for the life of an active watch (see CLAUDE.md "Standby Watch").
+#
+# INSTALL SAFELY — never pipe into `crontab -` (that is how 7/06 got wiped):
+#     crontab /Users/michaelhsu/golf-bot/crontab.txt
+#     crontab -l            # verify separately, in its own command
+#
+# The launchd agents were unloaded + disabled (renamed *.plist.disabled) on
+# 2026-07-20. Do NOT re-load them or they will double-fire alongside cron.
+
+# Monday 7:51 PM CT — main multi-account release bot
 51 19 * * 1 > /Users/michaelhsu/golf-bot/multi_bot.log && /usr/bin/python3 -u /Users/michaelhsu/golf-bot/multi_bot.py >> /Users/michaelhsu/golf-bot/multi_bot.log 2>&1
+
+# Every 15 min, Sun + Tue-Sat (Mon excluded — the 8 PM bot owns it) — standby watch
 */15 * * * 0,2-6 /usr/bin/python3 -u /Users/michaelhsu/golf-bot/standby_bot.py check >> /Users/michaelhsu/golf-bot/standby.log 2>&1
