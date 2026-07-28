@@ -59,7 +59,7 @@ from config import (
     COURSE_CODES,
     TIME_PRIORITY,
     NUM_PLAYERS as DEFAULT_NUM_PLAYERS,
-    FALLBACK_NUM_PLAYERS,
+    MIN_PLAYERS_MORNING,
     MIN_HOUR,
     MAX_HOUR,
     FALLBACK_MAX_HOUR,
@@ -1457,7 +1457,7 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
                 if weekend and day_name:
                     claimed, cur_state = shared_state.claim_booking(
                         weekend, day_name, details, ACCOUNT_ID,
-                        course=course_name,
+                        course=course_name, players=num_players,
                     )
                     if not claimed:
                         # Day was already at MAX bookings when we tried to claim,
@@ -1563,10 +1563,39 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
 # Day-level orchestration (two-pass: morning then fallback window)
 # ======================================================================
 
+def build_attempt_plan(num_players: int) -> list[tuple[str, int, int]]:
+    """(label, max_hour, players) attempts for one day, best first.
+
+    Walks the morning window DOWN through party sizes before widening to the
+    afternoon, so a smaller morning group outranks a full afternoon group:
+
+        morning/4p -> morning/3p -> morning/2p -> afternoon/4p
+
+    The afternoon is deliberately full-size only. A reduced party in the
+    afternoon is the worst of both worlds — neither the preferred time nor
+    the whole group — so it is never attempted.
+
+    MIN_PLAYERS_MORNING == num_players disables the ladder entirely, and a
+    floor above num_players is clamped rather than producing an empty plan.
+    """
+    floor = max(1, min(MIN_PLAYERS_MORNING, num_players))
+    plan = [(f"morning/{p}p", MAX_HOUR, p)
+            for p in range(num_players, floor - 1, -1)]
+    plan.append((f"afternoon/{num_players}p", FALLBACK_MAX_HOUR, num_players))
+    return plan
+
+
 def try_book_day(page, date: str, day_name: str, num_players: int,
                  blacklist: set, exclude_course: str = None,
                  dry_run: bool = False, weekend: str = None) -> dict:
-    """Two-pass search: morning window first, then widen to FALLBACK_MAX_HOUR.
+    """Search the morning window at every party size before widening to the
+    afternoon: morning@4, morning@3, morning@2, then afternoon@4.
+
+    The player count is the INNER loop on purpose (2026-07-27). Previously the
+    caller retried with FALLBACK_NUM_PLAYERS only after try_book_day had run
+    BOTH windows at full size, which meant a full-party afternoon slot always
+    won before a smaller morning party was ever considered — the opposite of
+    the preference. See build_attempt_plan.
 
     `weekend` is the combined weekend label used for multi-account coordination
     (e.g. "4/25/2026 - 4/26/2026"). If another account already booked this day
@@ -1584,9 +1613,15 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
             print(f"\n  === {day_name.upper()} already at capacity ({', '.join(booked_by_list)}) — skipping ===")
             return {"success": False, "details": None, "course": None, "skipped": True}
 
-    passes = [("morning", MAX_HOUR), ("fallback", FALLBACK_MAX_HOUR)]
-
-    for pass_label, max_hour in passes:
+    for pass_label, max_hour, pass_players in build_attempt_plan(num_players):
+        # A reduced-party attempt is only allowed while the day still has its
+        # reduced allowance. Re-checked per pass because siblings book in
+        # parallel; claim_booking enforces it for real, inside the lock.
+        if weekend and pass_players < num_players:
+            if shared_state.day_reduced_slots_left(weekend, day_name) <= 0:
+                print(f"\n  === {day_name.upper()} / {pass_label} pass — skipped, "
+                      f"a smaller-party booking already exists today ===")
+                continue
         print(f"\n  === {day_name.upper()} / {pass_label} pass (until {max_hour}:00) ===")
         courses = list(COURSE_CODES.items())
         random.shuffle(courses)
@@ -1618,7 +1653,7 @@ def try_book_day(page, date: str, day_name: str, num_players: int,
                 if course_name in excluded_courses:
                     continue
                 result = search_and_book_course(
-                    page, course_code, course_name, date, num_players,
+                    page, course_code, course_name, date, pass_players,
                     max_hour, blacklist, dry_run=dry_run,
                     weekend=weekend, day_name=day_name,
                 )
@@ -1708,21 +1743,11 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
             exclude_course=exclude_course, dry_run=dry_run,
             weekend=weekend,
         )
-        # Player-count fallback: if no slots for num_players, retry with fewer.
-        # 2A: skip the fallback if try_book_day halted on an unverified booking
-        # — we may have already committed and don't want to risk a second one.
-        if (not results[day_key]["success"]
-                and not results[day_key].get("skipped")
-                and not results[day_key].get("halt_day")
-                and not results[day_key].get("abort_run")
-                and FALLBACK_NUM_PLAYERS is not None
-                and FALLBACK_NUM_PLAYERS < num_players):
-            print(f"\n  === {day_name.upper()} / retrying with {FALLBACK_NUM_PLAYERS} players ===")
-            results[day_key] = try_book_day(
-                page, date, day_name, FALLBACK_NUM_PLAYERS, blacklist,
-                exclude_course=exclude_course, dry_run=dry_run,
-                weekend=weekend,
-            )
+        # NOTE: there is deliberately no second try_book_day call for a smaller
+        # party here. Player count is now the inner loop of build_attempt_plan,
+        # so smaller morning parties are tried BEFORE the afternoon. Retrying
+        # here would have re-run the whole afternoon at reduced size, which is
+        # the one combination we never want.
         # Persist state after each day — survives a crash mid-run.
         # Also persist halt_day so session retries don't re-attempt a day where
         # we may have already booked but couldn't verify.

@@ -392,8 +392,23 @@ ephemeral port (browser spawn + account lookup stubbed) to exercise the
 `/api/booking/cancel` and `/api/cancel/jobs` routes, the dup-spawn guard, and
 the required-confirmation-number validation.
 
+`tests/test_morning_ladder.py` covers `build_attempt_plan` (morning walks
+down through party sizes before the afternoon; the afternoon is full-size
+only; floor clamping), that `try_book_day` actually SEARCHES in that order,
+and the one-reduced-booking-per-day cap in `shared_state` (including that
+legacy bookings with no `players` field read as full-party).
+
+`tests/test_multi_bot.py` covers the Queue-it wait extractor and the run-log
+archiver (missing files, undecodable bytes, unwritable archive root).
+
+**Any test touching `shared_state` MUST redirect
+`shared_state.SHARED_STATE_FILE` to a tmp path** — `reset_for_weekend` and
+`clear_shared_state` write and delete the real file, and pointing them at
+the default location destroys the live weekend's booking record.
+
 There are no browser-integration tests — the only way to verify the
-Playwright booking/cancel path is `--dry-run` against the live site.
+Playwright booking/cancel path is `--dry-run` against the live site, and
+that only exercises a day the accounts haven't already filled.
 
 ## Configuration
 
@@ -401,7 +416,13 @@ Playwright booking/cancel path is `--dry-run` against the live site.
 - `COURSE_CODES` — Vermont Systems secondarycode -> course name map (Lions > Roy Kizer > Jimmy Clay > Morris Williams)
 - `TIME_PRIORITY` — ordered list of preferred tee times (9am > 8am > 10am > 11am > 12pm > 1pm > fallback afternoon)
 - `NUM_PLAYERS` — default 4
-- `FALLBACK_NUM_PLAYERS` — default 2; if no slots for NUM_PLAYERS, retry with this many. Set to None to disable.
+- `FALLBACK_NUM_PLAYERS` — used only by `standby_bot.py` now. The Monday
+  release path ignores it; see `MIN_PLAYERS_MORNING` below.
+- `MIN_PLAYERS_MORNING` — default 2. The morning pass walks NUM_PLAYERS down
+  to this floor BEFORE widening to the afternoon. Set equal to `NUM_PLAYERS`
+  to disable the ladder.
+- `MAX_REDUCED_BOOKINGS_PER_DAY` — default 1. How many smaller-than-NUM_PLAYERS
+  bookings one day may hold, so the group can't be split across two courses.
 - `MIN_HOUR = 8`, `MAX_HOUR = 11` — primary "morning" search window (8am –
   11:59am). Was 13 until 2026-07-27, which let the morning pass "succeed" by
   booking 1:51 PM and spend one of the day's two `MAX_BOOKINGS_PER_DAY` slots
@@ -430,10 +451,24 @@ NOTIFICATION_EMAIL=...
    and retries.
 2. `run_booking_session()` logs in, waits until 8:00 PM CT, re-verifies
    auth, then attempts Saturday then Sunday.
-3. For each day: first try with `NUM_PLAYERS` (4). If no slots found
-   across all passes, retry with `FALLBACK_NUM_PLAYERS` (2).
-4. `try_book_day()` runs a two-pass search: morning window first
-   (`MAX_HOUR=11`), then a fallback pass widening to `FALLBACK_MAX_HOUR=17`.
+3. For each day, `build_attempt_plan()` orders the attempts. **Player count
+   is the INNER loop** (changed 2026-07-27):
+
+       morning/4p -> morning/3p -> morning/2p -> afternoon/4p
+
+   so a smaller morning party outranks a full afternoon party. Before this,
+   the caller only retried a smaller party AFTER `try_book_day` had run both
+   windows at full size, so a full-party afternoon slot always won first —
+   which is how 2026-07-27 ended with four afternoon bookings. The afternoon
+   is deliberately full-size only; a reduced party in the afternoon is
+   neither the preferred time nor the whole group.
+4. `try_book_day()` walks that plan. The morning floor is
+   `MIN_PLAYERS_MORNING` (2) and the afternoon uses `FALLBACK_MAX_HOUR=17`.
+   At most `MAX_REDUCED_BOOKINGS_PER_DAY` (1) sub-4 bookings are allowed per
+   day: accounts race in parallel and cross-account course diversity pushes
+   siblings onto DIFFERENT courses, so two reduced bookings would split the
+   group across two courses at two times. The cap is pre-checked per pass
+   and enforced for real inside `shared_state.claim_booking`'s lock.
 5. For each (course, round, pass) combination, `search_and_book_course()`
    navigates via `navigate_to_search()` (Queue-it + session-expiry safe,
    loops up to 3 recovery attempts for chained failures) and calls

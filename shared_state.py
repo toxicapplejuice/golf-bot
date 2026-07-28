@@ -41,6 +41,16 @@ try:
 except Exception:
     MAX_BOOKINGS_PER_DAY = 2
 
+try:
+    from config import NUM_PLAYERS as FULL_PARTY
+except Exception:
+    FULL_PARTY = 4
+
+try:
+    from config import MAX_REDUCED_BOOKINGS_PER_DAY
+except Exception:
+    MAX_REDUCED_BOOKINGS_PER_DAY = 1
+
 
 def _empty_state(weekend: str) -> dict:
     return {
@@ -93,6 +103,36 @@ def _load_or_empty(f, weekend: str) -> dict:
     return state
 
 
+def is_reduced_booking(booking: dict) -> bool:
+    """True if this booking is for a smaller party than the full group.
+
+    "Reduced" is measured against config.NUM_PLAYERS so every account agrees
+    on the definition regardless of its own --players flag. Legacy bookings
+    with no recorded player count are treated as full, which is the safe
+    reading: it can only make the guard more permissive, never less.
+    """
+    players = booking.get("players")
+    return players is not None and players < FULL_PARTY
+
+
+def reduced_bookings(weekend: str, day: str) -> list:
+    """Bookings on `day` that are for a smaller-than-full party."""
+    state = read_shared(weekend)
+    entry = state.get(day) or {}
+    return [b for b in (entry.get("bookings", []) or []) if is_reduced_booking(b)]
+
+
+def day_reduced_slots_left(weekend: str, day: str) -> int:
+    """How many more reduced-party bookings `day` may still take.
+
+    Caps sub-full bookings at MAX_REDUCED_BOOKINGS_PER_DAY so the group can't
+    end up split across two courses at two times — the failure mode that the
+    2026-07-27 morning-ladder change would otherwise open up, since
+    cross-account course diversity actively pushes siblings apart.
+    """
+    return max(0, MAX_REDUCED_BOOKINGS_PER_DAY - len(reduced_bookings(weekend, day)))
+
+
 def read_shared(weekend: str) -> dict:
     """Read the current shared state. Returns fresh empty state if file is
     missing, empty, or references a different weekend."""
@@ -104,18 +144,27 @@ def read_shared(weekend: str) -> dict:
 
 
 def claim_booking(weekend: str, day: str, details: str,
-                  account_id: str, course: str = None) -> tuple[bool, dict]:
+                  account_id: str, course: str = None,
+                  players: int = None) -> tuple[bool, dict]:
     """Atomically append a booking for `account_id` to `day`'s list, IF there's
-    capacity (len(bookings) < MAX_BOOKINGS_PER_DAY) and the account hasn't
-    already booked this day.
+    capacity (len(bookings) < MAX_BOOKINGS_PER_DAY), the account hasn't
+    already booked this day, and — for a smaller-than-full party — the day
+    hasn't already used up its MAX_REDUCED_BOOKINGS_PER_DAY allowance.
 
     `course` is recorded so sibling accounts can read courses_booked() and
     avoid double-booking the same course on the same day (best-effort
-    diversity). Optional for backward compatibility.
+    diversity). `players` is recorded so the reduced-party cap can be
+    enforced. Both are optional for backward compatibility.
+
+    The reduced-party check lives HERE, inside the lock, because accounts race
+    in parallel subprocesses: two of them can both observe "no reduced booking
+    yet" and both go on to book. Callers still pre-check to avoid wasted work,
+    but this is the decision that actually holds.
 
     Returns (claimed, current_state):
         claimed=True  -> booking was recorded
-        claimed=False -> day is full OR this account already booked
+        claimed=False -> day is full, this account already booked, or the
+                         reduced-party allowance is spent
 
     `day` must be "saturday" or "sunday".
     """
@@ -135,10 +184,19 @@ def claim_booking(weekend: str, day: str, details: str,
         if len(bookings) >= MAX_BOOKINGS_PER_DAY:
             return False, state
 
+        # Reduced-party allowance spent? (keeps the group from splitting
+        # across two courses at two times)
+        candidate = {"players": players}
+        if is_reduced_booking(candidate):
+            already = sum(1 for b in bookings if is_reduced_booking(b))
+            if already >= MAX_REDUCED_BOOKINGS_PER_DAY:
+                return False, state
+
         bookings.append({
             "booked_by": account_id,
             "details": details,
             "course": course,
+            "players": players,
             "booked_at": datetime.now().isoformat(timespec="seconds"),
         })
 

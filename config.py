@@ -52,6 +52,19 @@ FALLBACK_NUM_PLAYERS = None
 # at the same course so a group of 8 can play back-to-back.
 MAX_BOOKINGS_PER_DAY = 2
 
+# Morning player ladder (2026-07-27). The morning pass tries NUM_PLAYERS and
+# walks DOWN to this floor BEFORE the search ever widens to the afternoon,
+# because a smaller group in the morning beats a full group in the afternoon.
+# Set equal to NUM_PLAYERS to disable the ladder.
+MIN_PLAYERS_MORNING = 2
+
+# How many smaller-than-NUM_PLAYERS bookings a single day may hold. Capped at
+# 1 so the group can't be split across two courses at two times: accounts book
+# in parallel and cross-account course diversity actively pushes them apart,
+# so two reduced bookings would land at DIFFERENT courses. Enforced inside the
+# shared_state lock, not just pre-checked.
+MAX_REDUCED_BOOKINGS_PER_DAY = 1
+
 # Booking window — the FIRST-pass ("morning") window. Keep this a real
 # morning: at 13 it accepted anything through 1:59 PM, so on 2026-07-27 the
 # morning pass "succeeded" by booking 1:51 PM and spent one of the day's two
