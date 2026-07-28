@@ -155,6 +155,34 @@ class TestTryBookDayFollowsThePlan:
         assert (2, bot.MAX_HOUR) in attempts
 
 
+class TestIsDayResolved:
+    """A resolved day must never be retried: every retry is a full re-login,
+    and WebTrac rate-limits ~3 rapid logins per account. On 2026-07-27 an
+    account whose days were both at capacity spent its entire 30-minute
+    budget re-logging-in to skip them again."""
+
+    def test_booked_is_resolved(self):
+        assert bot.is_day_resolved({"success": True}) is True
+
+    def test_halted_is_resolved(self):
+        assert bot.is_day_resolved({"success": False, "halt_day": True}) is True
+
+    def test_skipped_is_resolved(self):
+        # Regression: `skipped` used to be missing from the check, which is
+        # what caused the futile retry loop.
+        assert bot.is_day_resolved({"success": False, "skipped": True}) is True
+
+    def test_open_day_is_not_resolved(self):
+        assert bot.is_day_resolved({"success": False}) is False
+
+    def test_falsy_flags_are_not_resolved(self):
+        assert bot.is_day_resolved(
+            {"success": False, "skipped": False, "halt_day": False}) is False
+
+    def test_empty_result_is_not_resolved(self):
+        assert bot.is_day_resolved({}) is False
+
+
 class TestReducedBookingCap:
     """NOTE: every test here MUST redirect SHARED_STATE_FILE to a temp path.
     These helpers write and delete the file at module scope, so pointing them

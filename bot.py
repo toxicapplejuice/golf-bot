@@ -1563,6 +1563,18 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
 # Day-level orchestration (two-pass: morning then fallback window)
 # ======================================================================
 
+def is_day_resolved(day_result: dict) -> bool:
+    """True when nothing this run does can change `day_result`.
+
+    Booked, halted for manual review, or closed to this account (already
+    booked by it, or at MAX_BOOKINGS_PER_DAY across accounts). Retrying a
+    resolved day costs a full re-login and can only produce the same answer.
+    """
+    return bool(day_result.get("success")
+                or day_result.get("halt_day")
+                or day_result.get("skipped"))
+
+
 def build_attempt_plan(num_players: int) -> list[tuple[str, int, int]]:
     """(label, max_hour, players) attempts for one day, best first.
 
@@ -1737,6 +1749,13 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
             # duplicates pile up.
             print(f"\n=== {day_name.upper()} halted in prior session (unverified booking) — skipping ===")
             return
+        if results[day_key].get("skipped"):
+            # This account already booked the day, or the day hit
+            # MAX_BOOKINGS_PER_DAY across accounts. Both are permanent for the
+            # rest of this run — bookings are only ever appended — so there is
+            # nothing to re-attempt.
+            print(f"\n=== {day_name.upper()} closed to this account (booked or at capacity) — skipping ===")
+            return
         print(f"\n=== BOOKING {day_name.upper()} ===")
         results[day_key] = try_book_day(
             page, date, day_name, num_players, blacklist,
@@ -1831,6 +1850,22 @@ def run_booking(args) -> dict:
             print("  [recovery] Created fresh browser page")
             return page
 
+        # Stop retrying sessions once every day is resolved. Without this we
+        # burn the remaining budget re-logging-in each session just to skip
+        # both days again — on 2026-07-27 one account did that for its full
+        # 30 minutes, and every session costs a real login against WebTrac's
+        # ~3-rapid-logins-per-account limit.
+        #
+        # All three resolved states are permanent for the rest of the run:
+        #   success   — booked
+        #   halt_day  — possible-but-unverified booking, needs a human
+        #   skipped   — this account already booked the day, or the day hit
+        #               MAX_BOOKINGS_PER_DAY. Bookings are only ever appended
+        #               during a run, so capacity never re-opens.
+        def all_days_resolved() -> bool:
+            return (is_day_resolved(results["saturday"])
+                    and is_day_resolved(results["sunday"]))
+
         try:
             while True:
                 session_count += 1
@@ -1842,16 +1877,12 @@ def run_booking(args) -> dict:
                 if results["saturday"]["success"] and results["sunday"]["success"]:
                     print("\n*** Both days booked! ***")
                     break
-                # 2A: stop retrying sessions if every day is resolved (either
-                # booked or halted for manual review). Without this we'd burn
-                # the remaining budget repeatedly logging in just to skip both
-                # halted days each session.
-                sat_done = (results["saturday"]["success"]
-                            or results["saturday"].get("halt_day"))
-                sun_done = (results["sunday"]["success"]
-                            or results["sunday"].get("halt_day"))
-                if sat_done and sun_done:
-                    print("\n*** Both days resolved (booked or halted for review) ***")
+                # Checked here too (not just before the sleep below) so a run
+                # resuming from a state file where both days are already
+                # resolved never opens a browser session at all.
+                if all_days_resolved():
+                    print("\n*** Both days resolved (booked, halted, or closed "
+                          "to this account) — nothing left to retry ***")
                     break
 
                 print(f"\n{'=' * 50}")
@@ -1886,6 +1917,14 @@ def run_booking(args) -> dict:
                         f"likely site overload/anti-bot at release. Check manually.",
                         priority="high", tags="warning",
                     )
+                    break
+
+                # Re-check before sleeping: this session may have just resolved
+                # the last open day, and there is no point burning 10s (and the
+                # next session's login) to discover that at the top of the loop.
+                if all_days_resolved():
+                    print("\n*** Both days resolved (booked, halted, or closed "
+                          "to this account) — nothing left to retry ***")
                     break
 
                 remaining = args.max_time - (time.time() - start_time)

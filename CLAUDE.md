@@ -448,7 +448,14 @@ NOTIFICATION_EMAIL=...
 1. `run_booking()` launches Firefox **once** and reuses the same page
    across retries (so Queue-it progress is never thrown away). If the
    page/browser dies mid-session, the outer loop creates a fresh page
-   and retries.
+   and retries. The loop stops as soon as `is_day_resolved()` is true for
+   both days — booked, halted for review, or **skipped** (this account
+   already booked it, or the day hit `MAX_BOOKINGS_PER_DAY`). `skipped`
+   was missing from that check until 2026-07-27, so an account whose days
+   were both filled by siblings spent its entire 30-minute budget
+   re-logging-in to skip them again — 18 sessions, 18 logins, against
+   WebTrac's ~3-rapid-logins-per-account limit. All three states are
+   permanent within a run because bookings are only ever appended.
 2. `run_booking_session()` logs in, waits until 8:00 PM CT, re-verifies
    auth, then attempts Saturday then Sunday.
 3. For each day, `build_attempt_plan()` orders the attempts. **Player count
