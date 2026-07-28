@@ -29,5 +29,5 @@
 # Monday 7:51 PM CT — main multi-account release bot
 51 19 * * 1 > /Users/michaelhsu/golf-bot/multi_bot.log && /usr/bin/python3 -u /Users/michaelhsu/golf-bot/multi_bot.py >> /Users/michaelhsu/golf-bot/multi_bot.log 2>&1
 
-# Every 15 min, Sun + Tue-Sat (Mon excluded — the 8 PM bot owns it) — standby watch
-*/15 * * * 0,2-6 /usr/bin/python3 -u /Users/michaelhsu/golf-bot/standby_bot.py check >> /Users/michaelhsu/golf-bot/standby.log 2>&1
+# Every 10 min, Sun + Tue-Sat (Mon excluded — the 8 PM bot owns it) — standby watch
+*/10 * * * 0,2-6 /usr/bin/python3 -u /Users/michaelhsu/golf-bot/standby_bot.py check >> /Users/michaelhsu/golf-bot/standby.log 2>&1

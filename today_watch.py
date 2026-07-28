@@ -47,6 +47,7 @@ from bot import (
     clear_live_screenshot,
     configure_account_context,
     extract_available_slots,
+    force_fresh_login,
     login_with_retry,
     navigate_to_search,
     notify,
@@ -159,9 +160,25 @@ def _try_slots(page, slots, url, args, tried) -> str | None:
     'dry_run', 'needs_manual_check') or None to keep searching."""
     note = f"\n\n{args.success_note}" if args.success_note else ""
     for slot in slots:
-        print(f"    Trying {slot['time']} at {slot['course']}...", flush=True)
-        update_live_screenshot(page, f"today_watch: {slot['time']} at {slot['course']}")
-        status = attempt_booking_click(page, slot, dry_run=args.dry_run)
+        # Up to 2 attempts per slot: a checkout click that bounces to login
+        # ("session expired") while the browsing session still looks valid
+        # makes a plain re-login a no-op and the bounce repeats (the
+        # 2026-07-20 failure). Force a REAL login (cookies cleared) and
+        # retry the same slot once before moving on.
+        status = None
+        for attempt in (1, 2):
+            retry_label = " (fresh session)" if attempt == 2 else ""
+            print(f"    Trying {slot['time']} at {slot['course']}{retry_label}...",
+                  flush=True)
+            update_live_screenshot(page, f"today_watch: {slot['time']} at {slot['course']}")
+            status = attempt_booking_click(page, slot, dry_run=args.dry_run)
+            if status != "session_expired" or attempt == 2:
+                break
+            print("    session expired — forcing fresh re-login", flush=True)
+            if not force_fresh_login(page):
+                return None  # cycle over; next cycle starts a fresh login
+            if not navigate_to_search(page, url):
+                return None
         details = (f"{slot['time']} at {slot['course']} on {slot['date']} "
                    f"({args.players} players)")
 
@@ -200,12 +217,13 @@ def _try_slots(page, slots, url, args, tried) -> str | None:
             return "needs_manual_check"
 
         if status == "session_expired":
-            print("    session expired — re-logging in", flush=True)
-            if not login_with_retry(page, queue_mode="timeout"):
-                return None  # cycle over; next cycle starts a fresh login
-            if not navigate_to_search(page, url):
-                return None
-            continue
+            # Still bounced after a genuine fresh login — checkout is being
+            # refused session-wide, so don't burn more fresh logins this
+            # cycle (WebTrac rate-limits rapid logins). Next cycle starts a
+            # fresh browser + login anyway.
+            print("    session expired AGAIN after fresh re-login — "
+                  "ending cycle", flush=True)
+            return None
 
         # 'taken' / 'failed' — phantom or stale row; don't retry it this cycle
         print(f"    {status}")

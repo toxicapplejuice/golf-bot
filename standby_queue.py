@@ -106,7 +106,8 @@ def _compute_expiry(sunday_date_str: str) -> str:
 
 def add_watch(days: list[str], time_pref: str, players: int,
               min_players: int | None = None,
-              max_hour: int | None = None) -> dict:
+              max_hour: int | None = None,
+              account_id: str | None = None) -> dict:
     """Add a new standby watch. Returns the created watch dict.
 
     min_players sets a floor for the player-count fallback: the check will
@@ -116,6 +117,13 @@ def add_watch(days: list[str], time_pref: str, players: int,
     max_hour caps the end of the time_pref window (24h clock, inclusive
     hour): morning + max_hour=9 means 7am-9:59am. A cap at or past the
     window's end changes nothing. When None the pref's full window applies.
+
+    account_id books this watch under a specific accounts.json account
+    (WebTrac holds one tee time per account per day, so an upgrade watch
+    must book under a different account than the slot it would replace).
+    When None the check cycle's default account applies. Existence of the
+    id is validated by the caller against accounts.json — the queue only
+    requires a non-empty string.
     """
     for d in days:
         if d not in VALID_DAYS:
@@ -127,6 +135,9 @@ def add_watch(days: list[str], time_pref: str, players: int,
     if min_players is not None and not 1 <= min_players <= players:
         raise ValueError(
             f"Invalid min_players: {min_players} (must be 1-{players})")
+    if account_id is not None and (
+            not isinstance(account_id, str) or not account_id.strip()):
+        raise ValueError(f"Invalid account_id: {account_id!r} (must be a non-empty string)")
     if max_hour is not None:
         pref_min_minutes, _pref_max = TIME_PREF_RANGES[time_pref]
         pref_min_hour = pref_min_minutes // 60
@@ -150,6 +161,7 @@ def add_watch(days: list[str], time_pref: str, players: int,
         "players": players,
         "min_players": min_players,
         "max_hour": max_hour,
+        "account_id": account_id,
         "status": "watching",
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "last_checked_at": None,

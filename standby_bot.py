@@ -47,6 +47,7 @@ from bot import (
     configure_account_context,
     extract_available_slots,
     attempt_booking_click,
+    force_fresh_login,
     load_accounts,
     login_with_retry,
     navigate_to_search,
@@ -56,6 +57,12 @@ from bot import (
     update_live_screenshot,
     verify_booking_via_history,
 )
+
+# Slots that already fired a "checkout refused — book manually" alert this
+# cycle, keyed (date, course, time). The same open slot is often seen again
+# at lower player counts within one cycle; alert once, not three times.
+# (A fresh process each cron cycle re-alerts if the slot is still open.)
+_checkout_refused_alerted: set[tuple[str, str, str]] = set()
 
 try:
     from playwright_stealth import stealth_sync
@@ -128,15 +135,32 @@ def _search_course(
           f"{', '.join(s['time'] for s in slots[:5])}")
 
     for slot in slots:
-        print(f"    Trying {slot['time']} at {course_name}...", end=" ", flush=True)
-        update_live_screenshot(page, f"standby: {slot['time']} at {course_name}")
-        status = attempt_booking_click(page, slot, dry_run=dry_run)
+        # Up to 2 attempts per slot: if checkout bounces to login
+        # ("session expired"), the browsing session still looks valid so a
+        # normal re-login is a no-op and the bounce repeats forever (the
+        # 2026-07-20 failure). Force a REAL login (cookies cleared) and
+        # retry the same slot once before giving up on it.
+        status = None
+        for attempt in (1, 2):
+            retry_label = " (fresh session)" if attempt == 2 else ""
+            print(f"    Trying {slot['time']} at {course_name}{retry_label}...",
+                  end=" ", flush=True)
+            update_live_screenshot(page, f"standby: {slot['time']} at {course_name}")
+            status = attempt_booking_click(page, slot, dry_run=dry_run)
+            if status != "session_expired" or attempt == 2:
+                break
+            print("session expired — forcing fresh re-login")
+            if not force_fresh_login(page):
+                return "abort"
+            if not navigate_to_search(page, url):
+                return "continue"
 
         if status == "booked":
             print("BOOKED! — verifying...", end=" ", flush=True)
             if verify_booking_via_history(page, slot):
                 print("VERIFIED")
-                details = f"{slot['time']} at {course_name}{players_label}"
+                acct_tag = f" [{watch['account_id']}]" if watch.get("account_id") else ""
+                details = f"{slot['time']} at {course_name}{players_label}{acct_tag}"
                 standby_queue.mark_day_booked(watch["id"], day, details)
                 notify(
                     f"Standby: {day.capitalize()} booked!",
@@ -169,10 +193,24 @@ def _search_course(
             return "booked"
 
         if status == "session_expired":
-            print("session expired")
-            if not login_with_retry(page, queue_mode="timeout"):
-                return "abort"
-            return "continue"
+            # Still bounced after a genuine fresh login — auto-checkout is
+            # being refused site-side. Alert so the user can book by hand
+            # while the slot is still open (once per slot per cycle).
+            print("session expired AGAIN after fresh re-login — alerting")
+            slot_key = (slot["date"], slot["course"], slot["time"])
+            if slot_key not in _checkout_refused_alerted:
+                _checkout_refused_alerted.add(slot_key)
+                notify(
+                    "Standby: slot OPEN but checkout refused — book manually!",
+                    f"{day.capitalize()} {target_date}: {slot['time']} at "
+                    f"{course_name} ({num_players}p) is open, but WebTrac "
+                    f"bounced checkout to login even after a fresh sign-in. "
+                    f"Book it by hand ASAP.",
+                    priority="urgent", tags="warning,golf",
+                )
+            if not navigate_to_search(page, url):
+                return "continue"
+            continue
 
         print(status)
         if not navigate_to_search(page, url):
@@ -213,6 +251,19 @@ def _player_counts(watch: dict) -> list[int]:
     if FALLBACK_NUM_PLAYERS and FALLBACK_NUM_PLAYERS < players:
         counts.append(FALLBACK_NUM_PLAYERS)
     return counts
+
+
+def _group_by_account(watches: list[dict], default: str | None = None) -> dict:
+    """Group watches by the account that should book them.
+
+    A watch's own account_id wins; watches without one fall to `default`
+    (the check cycle's --account-id, or None = first enabled account).
+    Insertion order is preserved so the default group runs first.
+    """
+    groups: dict[str | None, list[dict]] = {}
+    for w in watches:
+        groups.setdefault(w.get("account_id") or default, []).append(w)
+    return groups
 
 
 def _search_day(page, day: str, watch: dict, dry_run: bool) -> bool:
@@ -287,24 +338,40 @@ def run_check(args) -> None:
         print(f"  [{w['id']}] {days} {w['time_pref']} ({w['players']}p) "
               f"— checked {w.get('check_count', 0)}x")
 
-    account = pick_account(getattr(args, "account_id", None))
-    configure_account_context(account["id"] if account else None)
+    groups = _group_by_account(watches, default=getattr(args, "account_id", None))
 
     with sync_playwright() as p:
         browser = p.firefox.launch(headless=not args.headful)
-        context = browser.new_context(viewport={"width": 1280, "height": 900})
-        page = context.new_page()
-        stealth_sync(page)
-
         try:
-            if not login_with_retry(page, queue_mode="timeout"):
-                print("Login failed — aborting check")
-                return
+            for acct_id, group in groups.items():
+                account = pick_account(acct_id)
+                if acct_id and (account is None or account["id"] != acct_id):
+                    print(f"\n=== Account {acct_id!r} not found — skipping "
+                          f"{len(group)} watch(es) ===")
+                    continue
+                acct_label = account["id"] if account else "default (.env)"
+                print(f"\n=== Account: {acct_label} — {len(group)} watch(es) ===")
+                configure_account_context(account["id"] if account else None)
 
-            for watch in watches:
-                print(f"\n--- Watch [{watch['id']}] ---")
-                standby_queue.update_watch_check(watch["id"])
-                check_watch(page, watch, dry_run=args.dry_run)
+                # Fresh context per account: cookies from one account's
+                # session must never leak into the next one's login.
+                context = browser.new_context(viewport={"width": 1280, "height": 900})
+                page = context.new_page()
+                stealth_sync(page)
+                try:
+                    if not login_with_retry(page, queue_mode="timeout"):
+                        print(f"Login failed for {acct_label} — skipping its watches")
+                        continue
+
+                    for watch in group:
+                        print(f"\n--- Watch [{watch['id']}] ---")
+                        standby_queue.update_watch_check(watch["id"])
+                        check_watch(page, watch, dry_run=args.dry_run)
+                finally:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
         finally:
             try:
                 browser.close()
@@ -317,12 +384,19 @@ def run_check(args) -> None:
 
 def cmd_add(args) -> None:
     """Add a new standby watch."""
+    if args.account_id is not None:
+        known = [a["id"] for a in load_accounts()]
+        if args.account_id not in known:
+            print(f"ERROR: account {args.account_id!r} not in accounts.json "
+                  f"(known: {', '.join(known) or 'none'})")
+            sys.exit(1)
     watch = standby_queue.add_watch(
         days=args.day,
         time_pref=args.time,
         players=args.players,
         min_players=args.min_players,
         max_hour=args.max_hour,
+        account_id=args.account_id,
     )
     min_minutes, max_minutes = _search_window(watch)
     print(f"Watch added: {watch['id']}")
@@ -330,6 +404,8 @@ def cmd_add(args) -> None:
     print(f"  Time: {watch['time_pref']} ({_fmt_minutes(min_minutes)}-{_fmt_minutes(max_minutes)})")
     floor = f" (min {watch['min_players']})" if watch.get("min_players") else ""
     print(f"  Players: {watch['players']}{floor}")
+    if watch.get("account_id"):
+        print(f"  Account: {watch['account_id']}")
     print(f"  Dates: {', '.join(f'{d}={v}' for d, v in watch['target_dates'].items())}")
     print(f"  Expires: {watch['expires_at']}")
 
@@ -346,7 +422,8 @@ def cmd_list(args) -> None:
         days = ", ".join(w["days"])
         checked = w.get("check_count", 0)
         last = w.get("last_checked_at") or "never"
-        print(f"[{w['id']}] {status} — {days} {w['time_pref']} ({w['players']}p)")
+        acct = f" [{w['account_id']}]" if w.get("account_id") else ""
+        print(f"[{w['id']}] {status} — {days} {w['time_pref']} ({w['players']}p){acct}")
         print(f"  Checked {checked}x | Last: {last} | Expires: {w['expires_at']}")
         for d in w["days"]:
             r = w.get("results", {}).get(d)
@@ -386,6 +463,10 @@ def main():
     p_add.add_argument("--max-hour", dest="max_hour", type=int, default=None,
                        help="Cap the end of the time window (24h inclusive "
                             "hour): morning + --max-hour 11 = 8am-11:59am")
+    p_add.add_argument("--account-id", dest="account_id", default=None,
+                       help="Book this watch under a specific accounts.json "
+                            "account (for upgrade watches: WebTrac holds one "
+                            "tee time per account per day)")
 
     sub.add_parser("list", help="List all watches")
 

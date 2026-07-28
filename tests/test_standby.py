@@ -112,6 +112,30 @@ class TestAddWatch:
         standby_queue.QUEUE_FILE = self._orig_file
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
+    def test_add_default_account_is_none(self):
+        watch = standby_queue.add_watch(["saturday"], "morning", 4)
+        assert watch["account_id"] is None
+
+    def test_add_stores_account_id(self):
+        watch = standby_queue.add_watch(
+            ["sunday"], "morning", 4, account_id="grant")
+        assert watch["account_id"] == "grant"
+
+    def test_add_rejects_empty_account_id(self):
+        for bad in ("", "   "):
+            try:
+                standby_queue.add_watch(["sunday"], "morning", 4, account_id=bad)
+                assert False, f"expected ValueError for {bad!r}"
+            except ValueError as e:
+                assert "account_id" in str(e)
+
+    def test_add_rejects_non_string_account_id(self):
+        try:
+            standby_queue.add_watch(["sunday"], "morning", 4, account_id=42)
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "account_id" in str(e)
+
     def test_add_basic_watch(self):
         watch = standby_queue.add_watch(["saturday", "sunday"], "morning", 4)
         assert watch["status"] == "watching"

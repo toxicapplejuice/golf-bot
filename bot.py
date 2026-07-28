@@ -234,7 +234,16 @@ def send_ntfy(title: str, message: str, priority: str = "default",
         req = urllib.request.Request(
             url, data=message.encode("utf-8"), headers=headers, method="POST"
         )
-        urllib.request.urlopen(req, timeout=10)
+        # The CLT Python's OpenSSL can't find the system CA bundle
+        # (CERTIFICATE_VERIFY_FAILED) — use certifi's when available.
+        ssl_ctx = None
+        try:
+            import ssl
+            import certifi
+            ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            pass
+        urllib.request.urlopen(req, timeout=10, context=ssl_ctx)
         print(f"ntfy sent: {safe_title}")
     except Exception as e:
         print(f"Failed to send ntfy: {e}")
@@ -613,14 +622,25 @@ def is_authenticated(page) -> bool:
     if is_in_queue(page) or is_on_login_page(page):
         return False
     try:
+        # A "Sign In" link only renders when logged OUT — its presence is
+        # definitive. This gate MUST come first: the 2026-07 redesign put
+        # "My Account" in the public (logged-out) nav too, so that link
+        # alone proves nothing. Trusting it made every fresh browser look
+        # "already authenticated", silently skipping login — searches still
+        # worked (public), but every checkout bounced to login.html
+        # (the 7/20 release wall and the 7/24 lost standby slots).
+        if page.locator("a:has-text('Sign In')").count() > 0:
+            return False
         if page.locator(
             "a:has-text('Sign Out'), a:has-text('Logout'), a:has-text('Log Out'), "
             "button:has-text('Sign Out'), button:has-text('Logout'), button:has-text('Log Out')"
         ).count() > 0:
             return True
-        if page.locator("a:has-text('My Account'), a:has-text('My Profile')").count() > 0:
-            return True
         if "you are logged in" in page.content().lower():
+            return True
+        # "My Account" is only meaningful once the Sign In gate above has
+        # ruled out the logged-out nav.
+        if page.locator("a:has-text('My Account'), a:has-text('My Profile')").count() > 0:
             return True
     except Exception:
         pass
@@ -718,8 +738,6 @@ def wait_until_release_time() -> None:
 # ======================================================================
 
 def login_once(page, queue_mode: str = "timeout") -> bool:
-    global _last_login_noop
-
     def step(label: str, action) -> bool:
         try:
             action()
@@ -753,7 +771,6 @@ def login_once(page, queue_mode: str = "timeout") -> bool:
     if is_authenticated(page):
         print("  [login] Already authenticated — skipping sign-in")
         update_live_screenshot(page, "logged in")
-        _last_login_noop = True
         return True
 
     if not step("click Sign In",
@@ -812,8 +829,32 @@ def login_once(page, queue_mode: str = "timeout") -> bool:
 
     print("  [login] Success!")
     update_live_screenshot(page, "logged in")
-    _last_login_noop = False
     return True
+
+
+def force_fresh_login(page, queue_mode: str = "timeout") -> bool:
+    """Clear session cookies, then perform a REAL form login.
+
+    Cart-bounce recovery needs this: when a checkout click bounces to
+    login.html, the *browsing* session still looks authenticated, so
+    login_once short-circuits on "already authenticated" and nothing
+    actually refreshes — the same slot then bounces again (the 2026-07-20
+    failure mode). Clearing cookies makes is_authenticated() false, so the
+    next login_once performs a genuine sign-in and mints a fresh session.
+
+    NEVER call this during the pre-release wait (wait_until_release_time
+    must stay pure time.sleep — see CLAUDE.md) or on navigation failures —
+    dropping cookies there would forfeit Queue-it progress for nothing.
+    Only call it AFTER a cart bounce (attempt_booking_click returned
+    "session_expired"), where the choice is between risking a queue
+    re-entry and never booking at all.
+    """
+    print("  [login] Forcing fresh login (clearing session cookies)")
+    try:
+        page.context.clear_cookies()
+    except Exception as e:
+        print(f"  [login] Cookie clear failed ({e}) — attempting login anyway")
+    return login_with_retry(page, queue_mode=queue_mode)
 
 
 def login_with_retry(page, queue_mode: str = "timeout") -> bool:
@@ -861,17 +902,17 @@ def set_rush_mode(enabled: bool) -> None:
 # was read as "session expired", so the bot re-logged in — but login was a no-op
 # ("already authenticated"), so nothing changed and the same slot bounced again.
 # The result was 192 futile attempts that burned the entire 30-minute budget
-# (and hammered the site) without ever booking. This breaker detects that loop
-# — consecutive no-op re-logins triggered by cart bounces — and aborts the run
-# so it fails fast instead of spinning. A genuine session expiry (which performs
-# a REAL login) or any cart action that actually reaches the site resets it, so
+# (and hammered the site) without ever booking. Recovery is now two layers
+# (2026-07-24, ported from the standby path): a bounced slot first gets ONE
+# force_fresh_login (cookies cleared, REAL re-auth) plus a same-slot retry;
+# only a bounce that survives that fresh session counts toward this breaker.
+# Too many consecutive surviving bounces means the site is refusing checkout
+# and spinning won't help — abort the run so it fails fast. Any cart action
+# that actually reaches the site (booked/taken/failed) resets the streak, so
 # only the pathological loop trips it.
 
 MAX_CART_BOUNCE_REEXPIRY = 5
 
-# Set by login_once: True when login short-circuited on "already authenticated"
-# (a no-op), False when a real form login was performed.
-_last_login_noop = False
 _cart_bounce_reexpiry = 0
 _circuit_tripped = False
 
@@ -884,10 +925,11 @@ def reset_session_circuit() -> None:
 
 
 def note_cart_bounce_reexpiry() -> bool:
-    """Record a no-op re-login caused by a cart bounce to login.
+    """Record a cart bounce that survived a fresh-login retry.
 
-    Returns True if the circuit is now tripped (too many consecutive no-op
-    re-expiries — the site is refusing checkout and retrying won't help).
+    Returns True if the circuit is now tripped (too many consecutive
+    surviving bounces — the site is refusing checkout and retrying won't
+    help).
     """
     global _cart_bounce_reexpiry, _circuit_tripped
     _cart_bounce_reexpiry += 1
@@ -1381,10 +1423,27 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
         if key in blacklist:
             continue
 
-        print(f"  [book] {slot['time']} at {course_name}...", end=" ", flush=True)
-        update_live_screenshot(page, f"attempting {slot['time']} at {course_name}")
-        status = attempt_booking_click(page, slot, dry_run=dry_run)
-        update_live_screenshot(page, f"{slot['time']} @ {course_name}: {status}")
+        # Up to 2 attempts per slot: a checkout click that bounces to
+        # login.html while the browsing session still looks valid makes a
+        # plain re-login a no-op (the 2026-07-20 failure). Force a REAL
+        # login (cookies cleared) and retry the same slot once; only a
+        # bounce that survives the fresh session counts toward the
+        # circuit breaker below.
+        status = None
+        for attempt in (1, 2):
+            retry_label = " (fresh session)" if attempt == 2 else ""
+            print(f"  [book] {slot['time']} at {course_name}{retry_label}...",
+                  end=" ", flush=True)
+            update_live_screenshot(page, f"attempting {slot['time']} at {course_name}")
+            status = attempt_booking_click(page, slot, dry_run=dry_run)
+            update_live_screenshot(page, f"{slot['time']} @ {course_name}: {status}")
+            if status != "session_expired" or attempt == 2:
+                break
+            print("session expired — forcing fresh re-login")
+            if not force_fresh_login(page):
+                return result
+            if not navigate_to_search(page, url):
+                return result
 
         if status == "booked":
             print("BOOKED! — verifying...", end=" ", flush=True)
@@ -1472,24 +1531,17 @@ def search_and_book_course(page, course_code: str, course_name: str, date: str,
             }
 
         if status == "session_expired":
-            print("session expired")
-            if not login_with_retry(page, queue_mode="timeout"):
+            # Bounced AGAIN even after a genuine fresh login — the site is
+            # refusing checkout for this session. Count it; if this keeps
+            # recurring across slots, looping is futile.
+            print("session expired AGAIN after fresh re-login")
+            if note_cart_bounce_reexpiry():
+                save_debug_screenshot(page, "cart_bounce_circuit_break")
+                print(f"  [book] CIRCUIT BREAKER: {MAX_CART_BOUNCE_REEXPIRY} "
+                      f"consecutive cart bounces that survived a fresh "
+                      f"re-login — site is refusing checkout; aborting run")
+                result["abort_run"] = True
                 return result
-            if _last_login_noop:
-                # Cart bounced us to login but the browsing session is still
-                # valid — the re-login did nothing. Count it; if this keeps
-                # recurring the site is refusing checkout and looping is futile.
-                if note_cart_bounce_reexpiry():
-                    save_debug_screenshot(page, "cart_bounce_circuit_break")
-                    print(f"  [book] CIRCUIT BREAKER: {MAX_CART_BOUNCE_REEXPIRY} "
-                          f"consecutive cart-bounce-to-login with a healthy "
-                          f"session — site is refusing checkout; aborting run")
-                    result["abort_run"] = True
-                    return result
-            else:
-                # A real re-authentication happened — genuine recovery, not the
-                # pathological no-op loop. Clear the streak.
-                note_cart_progress()
             if not navigate_to_search(page, url):
                 return result
             # DOM state is stale now — bail to outer loop
