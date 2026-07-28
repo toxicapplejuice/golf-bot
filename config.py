@@ -52,9 +52,12 @@ FALLBACK_NUM_PLAYERS = None
 # at the same course so a group of 8 can play back-to-back.
 MAX_BOOKINGS_PER_DAY = 2
 
-# Booking window (8am-1pm preferred)
+# Booking window — the FIRST-pass ("morning") window. Keep this a real
+# morning: at 13 it accepted anything through 1:59 PM, so on 2026-07-27 the
+# morning pass "succeeded" by booking 1:51 PM and spent one of the day's two
+# MAX_BOOKINGS_PER_DAY slots on a time that then had to be cancelled.
 MIN_HOUR = 8   # 8 AM
-MAX_HOUR = 13  # 1 PM (inclusive)
+MAX_HOUR = 11  # 11 AM (inclusive, so through 11:59 AM)
 
 # Fallback window — if morning window yields nothing, widen search up to this hour
 FALLBACK_MAX_HOUR = 17  # 5 PM (inclusive)

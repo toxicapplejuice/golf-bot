@@ -35,11 +35,18 @@ class TestIsTimeInRange:
     def test_morning_window_includes_8am(self):
         assert bot.is_time_in_range("8:00 AM")
 
-    def test_morning_window_includes_late_1pm(self):
-        assert bot.is_time_in_range("1:48 PM")
+    def test_morning_window_includes_late_11am(self):
+        # MAX_HOUR is inclusive of that hour's minutes.
+        assert bot.is_time_in_range("11:48 AM")
 
-    def test_morning_window_excludes_2pm(self):
-        assert not bot.is_time_in_range("2:00 PM")
+    def test_morning_window_excludes_noon(self):
+        assert not bot.is_time_in_range("12:00 PM")
+
+    def test_morning_window_excludes_early_afternoon(self):
+        # Regression for 2026-07-27: a 13 ceiling let the morning pass book
+        # 1:51 PM and burn one of the day's two booking slots on an
+        # afternoon time. Early-afternoon slots belong to the fallback pass.
+        assert not bot.is_time_in_range("1:51 PM")
 
     def test_morning_window_excludes_7am(self):
         assert not bot.is_time_in_range("7:00 AM")

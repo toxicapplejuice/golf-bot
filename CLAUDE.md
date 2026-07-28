@@ -10,13 +10,52 @@ Vermont Systems / WebTrac booking site releases them on Monday at 8:00 PM CT.
 
 **Local macOS crontab entry on this machine.** Nothing else.
 
+The live schedule is `crontab.txt` (install it with
+`crontab /Users/michaelhsu/golf-bot/crontab.txt`, then verify with a
+separate `crontab -l` — never pipe into `crontab -`). Currently:
+
 ```
-58 19 * * 1 > /Users/michaelhsu/golf-bot/booking.log && /usr/bin/python3 -u /Users/michaelhsu/golf-bot/bot.py >> /Users/michaelhsu/golf-bot/booking.log 2>&1
+40 19 * * 1 > /Users/michaelhsu/golf-bot/multi_bot.log && /usr/bin/python3 -u /Users/michaelhsu/golf-bot/multi_bot.py >> /Users/michaelhsu/golf-bot/multi_bot.log 2>&1
 ```
 
-The bot launches at 7:58 PM CT (2 minutes before release), hits the
-Queue-it waiting room intentionally, waits through it, lands authenticated
-right at 8:00 PM, and starts searching.
+The bot launches at 7:40 PM CT, hits the Queue-it waiting room
+intentionally, waits through it, and aims to be authenticated and idle
+BEFORE the 8:00 PM release so it can search the instant the board opens.
+
+### The launch time is the whole ballgame (2026-07-27)
+
+Slot quality is a near-perfect function of how fast the first booking
+lands after release. From `history.json`:
+
+| First booking | Earliest slot obtained |
+|---|---|
+| 8:01–8:02 PM | 8:00–8:40 AM |
+| 8:04 PM | 10:30 AM |
+| 8:06 PM | 11:31 AM |
+| 8:07 PM | 1:51 PM |
+
+Every minute late costs roughly 45–60 minutes of tee time quality, and
+there is no morning inventory left after about 8:05 PM.
+
+The gate is Queue-it, not the bot's speed. On 2026-07-27 the accounts
+entered the waiting room at ~7:52 and were not released until ~8:06:30
+(waits of 863/974/984s), so searching began six minutes after the board
+opened and every morning slot was already gone — at every player count.
+A 7:40 launch is sized to clear a ~15 minute queue before 8:00.
+
+Evidence that arriving earlier helps: the account that entered the queue
+earliest (Grant) also exited earliest, by ~2 minutes, which is FIFO-shaped
+rather than a randomized pre-queue lottery. This is n=1 — `multi_bot.py`
+now prints each account's queue wait and archives every run's logs to
+`logs/runs/<timestamp>/`, so the theory can be confirmed or refuted.
+Before 2026-07-27 those logs were truncated on every run and the evidence
+was destroyed weekly.
+
+**If you change the launch minute, move the hardware wake too.** cron
+silently skips fires while the Mac is asleep (`pmset` idle sleep is 1
+minute), so the weekly wake must be EARLIER than the launch:
+`sudo pmset repeat wakeorpoweron M 19:30:00`, verified with
+`pmset -g sched`.
 
 **This bot is NOT deployed to:**
 - Fly.io (old `fly.toml` was deleted in commit `42fc615`)
@@ -363,7 +402,11 @@ Playwright booking/cancel path is `--dry-run` against the live site.
 - `TIME_PRIORITY` — ordered list of preferred tee times (9am > 8am > 10am > 11am > 12pm > 1pm > fallback afternoon)
 - `NUM_PLAYERS` — default 4
 - `FALLBACK_NUM_PLAYERS` — default 2; if no slots for NUM_PLAYERS, retry with this many. Set to None to disable.
-- `MIN_HOUR = 8`, `MAX_HOUR = 13` — primary search window (8am – 1pm inclusive)
+- `MIN_HOUR = 8`, `MAX_HOUR = 11` — primary "morning" search window (8am –
+  11:59am). Was 13 until 2026-07-27, which let the morning pass "succeed" by
+  booking 1:51 PM and spend one of the day's two `MAX_BOOKINGS_PER_DAY` slots
+  on a time that then had to be cancelled. Early-afternoon slots are the
+  fallback pass's job, not the morning pass's.
 - `FALLBACK_MAX_HOUR = 17` — if morning pass finds nothing, widen to 5pm
 
 Secrets live in `.env` (gitignored):
@@ -390,7 +433,7 @@ NOTIFICATION_EMAIL=...
 3. For each day: first try with `NUM_PLAYERS` (4). If no slots found
    across all passes, retry with `FALLBACK_NUM_PLAYERS` (2).
 4. `try_book_day()` runs a two-pass search: morning window first
-   (`MAX_HOUR=13`), then a fallback pass widening to `FALLBACK_MAX_HOUR=17`.
+   (`MAX_HOUR=11`), then a fallback pass widening to `FALLBACK_MAX_HOUR=17`.
 5. For each (course, round, pass) combination, `search_and_book_course()`
    navigates via `navigate_to_search()` (Queue-it + session-expiry safe,
    loops up to 3 recovery attempts for chained failures) and calls

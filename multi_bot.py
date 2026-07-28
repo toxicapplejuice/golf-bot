@@ -21,6 +21,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -33,12 +35,73 @@ import bot  # noqa: E402
 import shared_state  # noqa: E402
 
 DEFAULT_MAX_TIME = 1800  # 30 min — same as single-account bot
+LOG_ARCHIVE_DIR = os.path.join(SCRIPT_DIR, "logs", "runs")
 
 
 def _open_log(account_id: str):
     """Open the per-account log file for writing. Truncate at start of run."""
     path = os.path.join(SCRIPT_DIR, f"booking_{account_id}.log")
     return open(path, "w", buffering=1)  # line-buffered
+
+
+def queue_wait_seconds(log_path: str) -> int | None:
+    """Longest '(Ns elapsed)' Queue-it wait recorded in a per-account log.
+
+    This is the number that predicts the whole night: the run can't search
+    until it clears the queue, and slot quality falls off a cliff after
+    ~8:02 PM. Returns None if the run never hit Queue-it.
+    """
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            waits = re.findall(r"\((\d+)s elapsed\)", f.read())
+    except OSError:
+        return None
+    return max((int(w) for w in waits), default=None)
+
+
+def archive_logs(account_ids: list[str]) -> str | None:
+    """Copy this run's logs into logs/runs/<timestamp>/ before the next run
+    truncates them, and return the archive directory.
+
+    The live booking_<id>.log / multi_bot.log paths are deliberately left in
+    place — the dashboard reads those by fixed name. Without this, every
+    Monday overwrites the only record of how long Queue-it held us, which is
+    exactly the measurement needed to tune the launch time.
+    """
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    dest = os.path.join(LOG_ARCHIVE_DIR, stamp)
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError as e:
+        print(f"  [archive] could not create {dest}: {e}")
+        return None
+
+    names = [f"booking_{a}.log" for a in account_ids] + ["multi_bot.log"]
+    saved = 0
+    for name in names:
+        src = os.path.join(SCRIPT_DIR, name)
+        if not os.path.exists(src):
+            continue
+        try:
+            shutil.copy2(src, os.path.join(dest, name))
+            saved += 1
+        except OSError as e:
+            print(f"  [archive] {name}: {e}")
+    print(f"  [archive] saved {saved} log(s) to {dest}")
+    return dest
+
+
+def report_queue_waits(account_ids: list[str]) -> None:
+    """Print each account's Queue-it wait so release-night timing is visible
+    in the run output itself, not just buried in the logs."""
+    print("\nQueue-it waits (longer wait = later search = worse tee times):")
+    for acct in account_ids:
+        path = os.path.join(SCRIPT_DIR, f"booking_{acct}.log")
+        wait = queue_wait_seconds(path)
+        if wait is None:
+            print(f"  {acct:<12} no queue hit")
+        else:
+            print(f"  {acct:<12} {wait}s ({wait // 60}m{wait % 60:02d}s)")
 
 
 def spawn_account(account: dict, args: argparse.Namespace) -> tuple[subprocess.Popen, any]:
@@ -174,6 +237,10 @@ def main() -> int:
                 p["log"].close()
             except Exception:
                 pass
+
+    account_ids = [p["account"]["id"] for p in procs]
+    report_queue_waits(account_ids)
+    archive_logs(account_ids)
 
     # Aggregate results from shared state
     final_state = shared_state.read_shared(weekend)

@@ -24,3 +24,4 @@ monitor.log
 standby_queue.json
 cancel_queue.json
 debug_screenshots/
+logs/
