@@ -699,6 +699,35 @@ def wait_for_queue(page, mode: str = "timeout",
 # Release-time wait
 # ======================================================================
 
+def compute_budget_start(now_ts: float, immediate: bool) -> float:
+    """Return the timestamp the --max-time budget should count from.
+
+    The budget must measure BOOKING time, not wall-clock time since launch.
+    In scheduled mode the process launches ~20 minutes before the 8:00 PM
+    release and spends that entire stretch in time.sleep(), so counting from
+    launch silently spends most of the budget on the pre-release wait.
+
+    On 2026-09-07 the 7:40 PM launch left only ~11 minutes of post-release
+    work: all three accounts were killed at 20:11 in the middle of Sunday's
+    morning pass, and Sunday's afternoon pass never ran at all. Moving the
+    launch earlier to beat Queue-it must not cost booking time.
+
+    - immediate (--now): the budget starts now; there is no wait to exclude.
+    - scheduled, before release: the budget starts at the release moment.
+    - scheduled, already past release: the budget starts now (a late launch
+      does not get to retroactively claim the time it missed).
+    """
+    if immediate:
+        return now_ts
+
+    now = datetime.fromtimestamp(now_ts)
+    release = now.replace(hour=RELEASE_HOUR, minute=RELEASE_MINUTE,
+                          second=0, microsecond=0)
+    if now >= release:
+        return now_ts
+    return now_ts + (release - now).total_seconds()
+
+
 def wait_until_release_time() -> None:
     """Sleep until 8:00 PM CT.
 
@@ -884,7 +913,25 @@ def login_with_retry(page, queue_mode: str = "timeout") -> bool:
 
 MAX_NAV_RECOVERY_ATTEMPTS = 3
 NAV_TIMEOUT_NORMAL = 30000
-NAV_TIMEOUT_RUSH = 12000
+NAV_TIMEOUT_RUSH = 7000
+
+# How many times a goto() may time out before we abandon THIS course and let
+# the caller rotate to the next one. This is deliberately separate from
+# MAX_NAV_RECOVERY_ATTEMPTS, which governs Queue-it / session-expiry recovery
+# and must keep its full budget (that funnel is the whole reason this helper
+# exists — see the CLAUDE.md note on the 2026-04-13 Queue-it incident).
+#
+# Rush mode fails fast on purpose. On 2026-09-07 WebTrac stopped serving pages
+# for the first ~6 minutes after release and 3 attempts x 12s meant 36 seconds
+# burned per dead course, learning nothing. Across the three accounts that was
+# 89 timeouts — michael and christian lost ~372s each, grant ~324s — which
+# consumed the entire morning/4p pass and the front of the 3p pass. By the time
+# the site answered, every morning slot the bot could see was already sold and
+# every click came back "taken". One 7s look, then move on: a full four-course
+# sweep costs ~30s instead of ~2.5 min, so we get many more looks at whichever
+# course IS responding.
+NAV_GOTO_ATTEMPTS_NORMAL = 3
+NAV_GOTO_ATTEMPTS_RUSH = 1
 
 _rush_mode = False
 
@@ -958,15 +1005,24 @@ def navigate_to_search(page, url: str) -> bool:
 
     Loops up to MAX_NAV_RECOVERY_ATTEMPTS times to handle chained failures
     (e.g. Queue-it wait -> session expired -> Queue-it again).
+
+    goto() timeouts are budgeted SEPARATELY from that recovery loop: in rush
+    mode we take one short look and give up so the caller can rotate to the
+    next course, while Queue-it and session-expiry recovery keep their full
+    budget. See NAV_GOTO_ATTEMPTS_RUSH.
     """
     nav_timeout = NAV_TIMEOUT_RUSH if _rush_mode else NAV_TIMEOUT_NORMAL
+    max_goto_attempts = (NAV_GOTO_ATTEMPTS_RUSH if _rush_mode
+                         else NAV_GOTO_ATTEMPTS_NORMAL)
+    goto_failures = 0
     for attempt in range(1, MAX_NAV_RECOVERY_ATTEMPTS + 1):
         try:
             page.goto(url, timeout=nav_timeout, wait_until="domcontentloaded")
         except (PlaywrightTimeout, PlaywrightError) as e:
             label = "goto timed out" if isinstance(e, PlaywrightTimeout) else f"goto failed ({type(e).__name__})"
-            print(f"  [nav] {label} (attempt {attempt})")
-            if attempt < MAX_NAV_RECOVERY_ATTEMPTS:
+            goto_failures += 1
+            print(f"  [nav] {label} (attempt {goto_failures}/{max_goto_attempts})")
+            if goto_failures < max_goto_attempts:
                 continue
             return False
 
@@ -1232,6 +1288,107 @@ def verify_booking_via_history(page, slot: dict) -> bool:
     return slot_in_history(page, slot)
 
 
+def _evaluate_checkout_result(page, slot: dict,
+                              clicked_finish: bool = False) -> str:
+    """Decide what actually happened after the One Click Finish click.
+
+    Split out of attempt_booking_click so the verdict logic is testable
+    without Playwright — see tests/test_taken_ambiguity.py. Pure with
+    respect to the page: it reads url/content and returns a status
+    string, never navigates.
+
+    Returns one of: booked | taken | session_expired |
+    unverified_post_click | failed
+    """
+    final_url = page.url.lower()
+    try:
+        page_text = page.content().lower()
+    except Exception:
+        page_text = ""
+
+    has_url_marker = any(marker in final_url for marker in BOOKED_URL_MARKERS)
+    has_text_marker = any(marker in page_text for marker in BOOKED_TEXT_MARKERS)
+    taken_kw = next((kw for kw in TAKEN_KEYWORDS if kw in page_text), None)
+
+    # A "taken" keyword on a CONFIRMATION-shaped URL is a contradiction, not a
+    # verdict — resolve it with a human, never with a guess.
+    #
+    # 2026-09-07: michael's 3:41 PM Roy Kizer checkout completed and landed on
+    # confirmation.html, but the page also carried one of the loose phrases in
+    # TAKEN_KEYWORDS ("maximum number" / "limit one tee time" / "duplicate" —
+    # plausibly an account-limit warning, since he already held a slot that
+    # day). The taken-check ran FIRST, so the bot recorded "taken", moved on,
+    # and booked 3:51 PM as well. Both reservations were real; neither reached
+    # shared_state.json or history.json, so nothing knew they existed.
+    #
+    # Guessing either way loses: calling it "taken" double-books, and calling
+    # it "booked" would record a phantom and stop searching. unverified_post_click
+    # is the existing safety net for exactly this — it halts the day for review.
+    if taken_kw and has_url_marker:
+        print(f"    [book] AMBIGUOUS: '{taken_kw}' on a confirmation URL "
+              f"({final_url[:80]}) — cannot tell booked from taken")
+        save_debug_screenshot(page, f"ambiguous_{slot['time'].replace(' ', '_')}")
+        return "unverified_post_click"
+
+    if taken_kw:
+        print(f"    [book] Slot taken (keyword match on page)")
+        return "taken"
+
+    if "login.html" in final_url:
+        return "session_expired"
+
+    # Check for POSITIVE confirmation signals — require at least one
+
+    if has_url_marker or has_text_marker:
+        # Receipt pages show course name and time — check they match the slot.
+        if verify_booking_on_page(page, slot, page_text):
+            return "booked"
+        if has_url_marker:
+            # 4A: confirmation-shaped URL is a very strong signal that the
+            # booking committed (these substrings only appear on Vermont Systems
+            # post-checkout pages). Trust it even when text-verify fails — past
+            # behavior of returning "failed" here caused the bot to immediately
+            # book another slot, generating duplicates. Flag for manual review.
+            print(f"    [book] Confirmation URL ({final_url[:80]}) but on-page slot text mismatch — trusting URL")
+            save_debug_screenshot(page, f"url_only_{slot['time'].replace(' ', '_')}")
+            notify(
+                f"[{ACCOUNT_DISPLAY_NAME}] Booking needs manual verification",
+                f"Reached confirmation URL for {slot['time']} at {slot['course']} "
+                f"on {slot['date']} but on-page slot text didn't match. Booking "
+                f"likely succeeded — please verify in reservation history.",
+                priority="high", tags="warning",
+            )
+            return "booked"
+        # Text marker only, verification failed — booking may or may not have
+        # committed. Halt the day to be safe.
+        print(f"    [book] Confirmation text without URL marker, verify failed — halting day")
+        save_debug_screenshot(page, f"text_only_unverified_{slot['time'].replace(' ', '_')}")
+        return "unverified_post_click"
+
+    # If we're still on addtocart.html, the checkout didn't complete.
+    # No booking committed here, so it's safe to try the next slot.
+    if "addtocart" in final_url:
+        if not clicked_finish:
+            print(f"    [book] On cart page but couldn't find 'One Click Finish' button")
+        else:
+            print(f"    [book] Clicked finish but still on cart page — slot likely taken")
+        save_debug_screenshot(page, f"cart_stuck_{slot['time'].replace(' ', '_')}")
+        return "failed"
+
+    # Unknown page. If we successfully clicked One Click Finish, the booking
+    # MIGHT have committed even though we don't recognize the destination —
+    # halt the day rather than risk a duplicate. If we never clicked finish,
+    # nothing committed, so retrying the next slot is safe.
+    if clicked_finish:
+        print(f"    [book] Ambiguous URL after One Click Finish ({page.url[:80]}) — halting day")
+        save_debug_screenshot(page, f"ambiguous_post_finish_{slot['time'].replace(' ', '_')}")
+        return "unverified_post_click"
+
+    print(f"    [book] Ambiguous outcome pre-finish (URL: {page.url[:60]})")
+    save_debug_screenshot(page, f"ambiguous_{slot['time'].replace(' ', '_')}")
+    return "failed"
+
+
 def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
     """Click cart button for a slot and determine result.
 
@@ -1318,72 +1475,7 @@ def attempt_booking_click(page, slot: dict, dry_run: bool = False) -> str:
         except Exception:
             continue
 
-    final_url = page.url.lower()
-    try:
-        page_text = page.content().lower()
-    except Exception:
-        page_text = ""
-
-    # Check for "taken" signals first — these are definitive
-    if any(kw in page_text for kw in TAKEN_KEYWORDS):
-        print(f"    [book] Slot taken (keyword match on page)")
-        return "taken"
-
-    if "login.html" in final_url:
-        return "session_expired"
-
-    # Check for POSITIVE confirmation signals — require at least one
-    has_url_marker = any(marker in final_url for marker in BOOKED_URL_MARKERS)
-    has_text_marker = any(marker in page_text for marker in BOOKED_TEXT_MARKERS)
-
-    if has_url_marker or has_text_marker:
-        # Receipt pages show course name and time — check they match the slot.
-        if verify_booking_on_page(page, slot, page_text):
-            return "booked"
-        if has_url_marker:
-            # 4A: confirmation-shaped URL is a very strong signal that the
-            # booking committed (these substrings only appear on Vermont Systems
-            # post-checkout pages). Trust it even when text-verify fails — past
-            # behavior of returning "failed" here caused the bot to immediately
-            # book another slot, generating duplicates. Flag for manual review.
-            print(f"    [book] Confirmation URL ({final_url[:80]}) but on-page slot text mismatch — trusting URL")
-            save_debug_screenshot(page, f"url_only_{slot['time'].replace(' ', '_')}")
-            notify(
-                f"[{ACCOUNT_DISPLAY_NAME}] Booking needs manual verification",
-                f"Reached confirmation URL for {slot['time']} at {slot['course']} "
-                f"on {slot['date']} but on-page slot text didn't match. Booking "
-                f"likely succeeded — please verify in reservation history.",
-                priority="high", tags="warning",
-            )
-            return "booked"
-        # Text marker only, verification failed — booking may or may not have
-        # committed. Halt the day to be safe.
-        print(f"    [book] Confirmation text without URL marker, verify failed — halting day")
-        save_debug_screenshot(page, f"text_only_unverified_{slot['time'].replace(' ', '_')}")
-        return "unverified_post_click"
-
-    # If we're still on addtocart.html, the checkout didn't complete.
-    # No booking committed here, so it's safe to try the next slot.
-    if "addtocart" in final_url:
-        if not clicked_finish:
-            print(f"    [book] On cart page but couldn't find 'One Click Finish' button")
-        else:
-            print(f"    [book] Clicked finish but still on cart page — slot likely taken")
-        save_debug_screenshot(page, f"cart_stuck_{slot['time'].replace(' ', '_')}")
-        return "failed"
-
-    # Unknown page. If we successfully clicked One Click Finish, the booking
-    # MIGHT have committed even though we don't recognize the destination —
-    # halt the day rather than risk a duplicate. If we never clicked finish,
-    # nothing committed, so retrying the next slot is safe.
-    if clicked_finish:
-        print(f"    [book] Ambiguous URL after One Click Finish ({page.url[:80]}) — halting day")
-        save_debug_screenshot(page, f"ambiguous_post_finish_{slot['time'].replace(' ', '_')}")
-        return "unverified_post_click"
-
-    print(f"    [book] Ambiguous outcome pre-finish (URL: {page.url[:60]})")
-    save_debug_screenshot(page, f"ambiguous_{slot['time'].replace(' ', '_')}")
-    return "failed"
+    return _evaluate_checkout_result(page, slot, clicked_finish)
 
 
 # ======================================================================
@@ -1823,7 +1915,10 @@ def run_booking(args) -> dict:
     print(f"Players: {args.players} | Max time: {args.max_time}s | "
           f"Dry run: {args.dry_run} | Headful: {args.headful}")
 
-    start_time = time.time()
+    # The budget measures booking time, not the pre-release sleep. See
+    # compute_budget_start() — counting from launch is what killed Sunday
+    # on 2026-09-07.
+    start_time = compute_budget_start(time.time(), immediate=args.now)
     run_started_iso = datetime.now().isoformat(timespec="seconds")
     session_count = 0
     reset_session_circuit()

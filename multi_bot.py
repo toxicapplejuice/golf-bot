@@ -202,8 +202,15 @@ def main() -> int:
         procs.append({"account": acc, "proc": proc, "log": log_handle})
         print(f"  Spawned {acc['display_name']} (pid {proc.pid})")
 
-    # Wait for all to finish, with overall timeout
-    deadline = time.time() + args.max_time + 60  # a little grace
+    # Wait for all to finish, with overall timeout.
+    #
+    # The deadline counts from the RELEASE moment, not from launch — the
+    # children budget the same way (bot.compute_budget_start). Counting from
+    # launch is what truncated the 2026-09-07 run: a 7:40 PM start with a
+    # 1800s budget killed every account at 20:11, mid-Sunday-morning-pass,
+    # so Sunday's afternoon pass never ran and Sunday finished 0/2.
+    deadline = bot.compute_budget_start(time.time(), immediate=args.now) \
+        + args.max_time + 60  # a little grace
     try:
         while any(p["proc"].poll() is None for p in procs):
             if time.time() > deadline:
