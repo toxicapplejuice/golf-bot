@@ -1813,7 +1813,7 @@ def run_booking_session(page, results: dict, saturday_date: str, sunday_date: st
         wait_until_release_time()
 
     set_rush_mode(True)
-    print("  [rush] Rush mode ON — 12s nav timeout for initial burst")
+    print("  [rush] Rush mode ON — 7s single-attempt nav timeout for initial burst")
 
     # After waking up at 8:00 PM, verify we're still logged in before searching
     if not is_authenticated(page):
