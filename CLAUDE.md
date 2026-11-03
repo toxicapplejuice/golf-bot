@@ -66,6 +66,67 @@ minute), so the weekly wake must be EARLIER than the launch:
 If you see references to any of the above in git history, they're dead.
 Ignore them.
 
+### 2026-09-07: Queue-it solved, three new gates found
+
+The 7:40 launch WORKED. All three accounts logged in at 19:40:28 and hit
+**zero Queue-it** ("no queue hit" for michael/grant/christian) — authenticated
+and idle before release, exactly as designed. The Queue-it theory in the
+section above is confirmed; do not undo the 7:40 launch.
+
+The bottleneck simply moved. Three separate problems, all now fixed:
+
+**1. WebTrac itself stopped serving pages for ~6 minutes after release.**
+89 `[nav] goto timed out` across the three accounts (michael 31, christian 31,
+grant 27). At the old 3 attempts x 12s, one dead course cost 36 seconds and
+taught the bot nothing — michael and christian burned ~372s each, grant ~324s.
+That consumed the ENTIRE morning/4p pass and the front of the 3p pass. By the
+time the site answered (~8:06), every morning slot the bot could see was
+already sold: all three accounts found real inventory (Morris Williams
+8:10/10:20/10:40/11:50, Roy Kizer 9:31/10:51/11:41/11:51, Lions
+9:10/11:40/11:50) and EVERY click returned "taken". First booking landed
+20:09:44 → 2:40 PM, right on the timing-law curve above.
+
+Fix: rush mode now takes ONE look at 7s (`NAV_GOTO_ATTEMPTS_RUSH`,
+`NAV_TIMEOUT_RUSH`) and rotates to the next course. A dead course costs ~7s
+instead of 36s; a four-course sweep ~28s instead of ~2.5 min. This budget is
+deliberately SEPARATE from `MAX_NAV_RECOVERY_ATTEMPTS` — Queue-it and
+session-expiry recovery keep their full 3 attempts, because that funnel is the
+whole reason `navigate_to_search` exists (see the 2026-04-13 invariant below).
+
+**2. The `--max-time` budget counted from LAUNCH, not from release.**
+A 7:40 start with `--max-time 1800` put multi_bot's kill deadline at 20:11, so
+20 of the 30 minutes were spent in `time.sleep()` and only ~11 minutes were
+real booking time. All three accounts were killed mid-Sunday-morning-pass and
+**Sunday's afternoon pass never ran at all** — that, not lack of inventory, is
+why Sunday finished 0/2. Moving the launch earlier to beat Queue-it had
+silently stolen booking time.
+
+Fix: `bot.compute_budget_start()` starts the clock at the release moment in
+scheduled mode (`--now` is unaffected). `bot.py`'s `start_time` and
+multi_bot's `deadline` both use it, so launch time and booking time are now
+fully decoupled — **you can move the launch earlier for free.**
+
+**3. A "taken" keyword outranked a confirmation URL, causing silent duplicates.**
+`TAKEN_KEYWORDS` was checked BEFORE the positive confirmation markers. Michael's
+3:41 PM Roy Kizer checkout completed and landed on `confirmation.html`, but the
+page also carried one of the loose phrases in that list (`"maximum number"`,
+`"limit one tee time"`, `"duplicate"`, `"not available"`, `"in use"` — plausibly
+an account-limit warning, since he already held a slot that day). The bot logged
+`Slot taken (keyword match on page)`, moved on, and booked 3:51 PM as well. Both
+reservations were REAL and neither reached `shared_state.json` or `history.json`,
+so nothing knew they existed. They were found only by pulling the receipt PDF.
+
+Fix: a taken-keyword on a confirmation-shaped URL is a contradiction, not a
+verdict — it now returns `unverified_post_click`, which halts the day for human
+review. Guessing either way loses: "taken" double-books, "booked" records a
+phantom and stops searching. The verdict logic was extracted to
+`bot._evaluate_checkout_result()` so it is testable without Playwright.
+
+**Lesson for future postmortems:** `shared_state.json` and `history.json` are
+not proof of what you actually hold. `fetch_receipt.py list/get` against each
+account is the ground truth, and it is the only thing that surfaced the two
+duplicate reservations.
+
 ## Critical invariant: do NOT reload the page during the pre-release wait
 
 `bot.py::wait_until_release_time()` must NOT touch the Playwright page.
@@ -401,6 +462,24 @@ legacy bookings with no `players` field read as full-party).
 `tests/test_multi_bot.py` covers the Queue-it wait extractor and the run-log
 archiver (missing files, undecodable bytes, unwritable archive root).
 
+`tests/test_budget_clock.py` covers `compute_budget_start` (the 2026-09-07
+fix): `--now` budgets from now, scheduled mode budgets from release, a late
+launch cannot reclaim missed time, launching earlier never shrinks the budget,
+and the budget start may legitimately be in the future (elapsed goes negative
+during the wait and must not trip the cap).
+
+`tests/test_nav_retry.py` covers `navigate_to_search`'s goto budget: rush mode
+gives up after ONE short attempt and rotates, normal mode still retries 3x at
+30s, and — critically — rush mode still re-navigates after a Queue-it release,
+after a re-login, and through a chained queue-then-login recovery. Those last
+three are the regression guard against shortening the Queue-it funnel.
+
+`tests/test_taken_ambiguity.py` covers `_evaluate_checkout_result`: a taken
+keyword on a confirmation URL is `unverified_post_click` for every loose
+keyword and every `BOOKED_URL_MARKER`, a genuine taken on a cart/search URL is
+still `taken`, a clean confirmation still books, and the pre-existing
+retryable-vs-halt split around `clicked_finish` is unchanged.
+
 **Any test touching `shared_state` MUST redirect
 `shared_state.SHARED_STATE_FILE` to a tmp path** — `reset_for_weekend` and
 `clear_shared_state` write and delete the real file, and pointing them at
@@ -429,6 +508,13 @@ that only exercises a day the accounts haven't already filled.
   on a time that then had to be cancelled. Early-afternoon slots are the
   fallback pass's job, not the morning pass's.
 - `FALLBACK_MAX_HOUR = 17` — if morning pass finds nothing, widen to 5pm
+
+`bot.py` holds the release-night timing knobs (changed 2026-09-07):
+- `NAV_TIMEOUT_RUSH = 7000` / `NAV_GOTO_ATTEMPTS_RUSH = 1` — one short look per
+  course during the 8 PM crunch, then rotate. Was 12000/3.
+- `NAV_TIMEOUT_NORMAL = 30000` / `NAV_GOTO_ATTEMPTS_NORMAL = 3` — unchanged.
+- `MAX_NAV_RECOVERY_ATTEMPTS = 3` — Queue-it / session-expiry recovery only.
+  **Do not collapse this back into the goto budget.**
 
 Secrets live in `.env` (gitignored):
 
